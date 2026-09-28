@@ -3,7 +3,7 @@
 """
 telegraph-epub-converter.py
 ====================================================
-telegra.ph 漫画网页一键转 EPUB 电子书工具（tkinter GUI）
+telegra.ph 漫画网页一键转 EPUB 电子书工具（tkinter GUI + CLI，支持批量）
 
 功能：
   1. 支持本地 HTML 网页保存文件（无扩展名 / .html / .htm 均可自动识别）
@@ -11,12 +11,19 @@ telegra.ph 漫画网页一键转 EPUB 电子书工具（tkinter GUI）
   3. 解析 HTML 提取漫画原图（保持清晰度），按页面顺序逐页排版生成漫画版 EPUB
      （每页一图 + 封面 + 目录导航 + 书脊导航 + 结构校验）
   4. 纯标准库实现：urllib 下载、zipfile 手写 EPUB3（OPF/XHTML/NCX），零第三方依赖
-  5. 简洁 tkinter 界面：输入框 / 输出目录选择 / 转换按钮 / 进度条 / 状态提示
+  5. 批量转换：
+     - GUI：输入列表支持添加多条（文件多选 / 在线链接 / 扫描文件夹），
+            可增删、清空，逐个转换并汇总成功 / 失败结果
+     - CLI：--cli 后接多个输入参数，或 --dir 扫描文件夹内所有 Telegraph 网页文件，
+            逐个转换并输出汇总统计
 
 用法：
-  * 双击脚本 → 弹出 GUI，粘贴本地路径或 telegra.ph 链接即可转换
+  * 双击脚本 → 弹出 GUI，通过"添加文件 / 添加链接 / 添加文件夹"建立输入列表后批量转换
   * 命令行（无界面）：
-      python telegraph-epub-converter.py --cli <本地路径或在线链接> [--out <输出目录>] [--title <书名>]
+      单输入  : python telegraph-epub-converter.py --cli <本地路径或在线链接> [--out <输出目录>] [--title <书名>]
+      多输入  : python telegraph-epub-converter.py --cli <输入1> <输入2> ... [--out <输出目录>]
+      扫文件夹: python telegraph-epub-converter.py --cli --dir <文件夹> [--out <输出目录>]
+      组合    : python telegraph-epub-converter.py --cli <输入1> --dir <文件夹> ... [--out <输出目录>]
 """
 
 import os
@@ -429,115 +436,218 @@ def convert(input_raw, out_dir, title=None, progress_cb=None, log_cb=None):
     return out_path
 
 
+# ---------------------------------------------------------------- 批量转换
+
+def scan_dir_for_html(dir_path):
+    """扫描文件夹内所有 Telegraph 漫画网页文件。
+
+    匹配规则：扩展名为 .html/.htm，或无扩展名文件；
+    文件名含 "telegraph"（telegra.ph 整页保存的默认命名）直接命中；
+    否则读取文件头 4KB，内容含 "telegra.ph" 也命中。
+    """
+    hits = []
+    if not os.path.isdir(dir_path):
+        raise ValueError("目录不存在：" + dir_path)
+    for name in sorted(os.listdir(dir_path)):
+        p = os.path.join(dir_path, name)
+        if not os.path.isfile(p):
+            continue
+        low = name.lower()
+        is_html = low.endswith((".html", ".htm"))
+        is_noext = "." not in low
+        if not (is_html or is_noext):
+            continue
+        if "telegraph" in low:
+            hits.append(p)
+            continue
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                head = f.read(4096)
+            if "telegra.ph" in head.lower():
+                hits.append(p)
+        except Exception:
+            pass
+    return hits
+
+
+def convert_batch(inputs, out_dir, title=None, progress_cb=None, log_cb=None):
+    """批量转换入口：逐个转换并汇总结果。
+
+    inputs: 输入列表（本地路径 / 在线链接均可）
+    title : 仅在单输入时生效；批量时自动取各文件标题
+    返回 [(input, ok, detail)]，detail 为输出路径（成功）或错误信息（失败）。
+    """
+    total = len(inputs)
+    results = []
+    for idx, inp in enumerate(inputs, 1):
+        base = (idx - 1) * 100.0 / total
+        span = 100.0 / total
+
+        def make_progress(base=base, span=span):
+            def cb(pct, msg):
+                if progress_cb:
+                    progress_cb(int(base + span * pct), msg)
+            return cb
+
+        def line(msg):
+            if log_cb:
+                log_cb(msg)
+
+        line("")
+        line("[%d/%d] 开始转换：%s" % (idx, total, inp))
+        try:
+            out_path = convert(inp, out_dir,
+                               title=title if total == 1 else None,
+                               progress_cb=make_progress(), log_cb=line)
+            results.append((inp, True, out_path))
+            line("[%d/%d] 成功：%s" % (idx, total, out_path))
+        except Exception as e:
+            results.append((inp, False, str(e)))
+            line("[%d/%d] 失败：%s" % (idx, total, e))
+    ok_count = sum(1 for _, ok, _ in results if ok)
+    line("")
+    line("批量转换完成：成功 %d / %d，失败 %d" % (ok_count, total, total - ok_count))
+    return results
+
+
 # ---------------------------------------------------------------- GUI
 
 if TK_AVAILABLE:
 
     class ConverterApp:
-        """简洁 tkinter 交互界面"""
+        """简洁 tkinter 交互界面（支持批量输入列表）"""
 
         def __init__(self, root):
             self.root = root
             self.queue = queue.Queue()
             self.worker = None
 
-            root.title("telegra.ph 漫画 → EPUB 转换器")
-            root.geometry("680x520")
-            root.minsize(600, 460)
+            root.title("telegra.ph 漫画 → EPUB 转换器（批量）")
+            root.geometry("700x620")
+            root.minsize(620, 540)
 
             pad = {"padx": 10, "pady": 5}
             frm = ttk.Frame(root, padding=10)
             frm.pack(fill="both", expand=True)
 
-            # 输入
-            ttk.Label(frm, text="① 输入（telegra.ph 在线链接 或 本地 HTML 文件路径）:").grid(
-                row=0, column=0, columnspan=3, sticky="w", **pad)
-            self.input_var = tk.StringVar()
-            ttk.Entry(frm, textvariable=self.input_var).grid(
-                row=1, column=0, sticky="ew", padx=(10, 5), pady=5)
-            ttk.Button(frm, text="浏览文件...", command=self.browse_input).grid(
-                row=1, column=1, padx=5, pady=5)
-            ttk.Button(frm, text="浏览文件夹*", command=self.browse_dir_input).grid(
-                row=1, column=2, padx=(5, 10), pady=5)
+            # ① 输入列表（多输入）
+            ttk.Label(frm, text="① 输入列表（在线链接 / 本地文件 / 文件夹扫描，支持多条）:").grid(
+                row=0, column=0, columnspan=4, sticky="w", **pad)
+            list_frame = ttk.Frame(frm)
+            list_frame.grid(row=1, column=0, columnspan=4, sticky="ew", padx=10, pady=2)
+            self.input_list = tk.Listbox(list_frame, height=6, selectmode=tk.EXTENDED)
+            self.input_list.pack(side="left", fill="both", expand=True)
+            list_scroll = ttk.Scrollbar(list_frame, command=self.input_list.yview)
+            list_scroll.pack(side="left", fill="y")
+            self.input_list.config(yscrollcommand=list_scroll.set)
 
-            # 输出目录
-            ttk.Label(frm, text="② 输出目录:").grid(row=2, column=0, columnspan=3, sticky="w", **pad)
+            btn_frame = ttk.Frame(frm)
+            btn_frame.grid(row=2, column=0, columnspan=4, sticky="w", padx=10, pady=4)
+            ttk.Button(btn_frame, text="添加文件...", command=self.browse_input).pack(side="left", padx=2)
+            ttk.Button(btn_frame, text="添加链接...", command=self.add_link).pack(side="left", padx=2)
+            ttk.Button(btn_frame, text="添加文件夹(扫描)...", command=self.browse_dir_input).pack(side="left", padx=2)
+            ttk.Button(btn_frame, text="删除选中", command=self.remove_selected).pack(side="left", padx=2)
+            ttk.Button(btn_frame, text="清空", command=self.clear_inputs).pack(side="left", padx=2)
+
+            # ② 输出目录
+            ttk.Label(frm, text="② 输出目录:").grid(row=3, column=0, columnspan=4, sticky="w", **pad)
             self.out_var = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Downloads"))
             ttk.Entry(frm, textvariable=self.out_var).grid(
-                row=3, column=0, sticky="ew", padx=(10, 5), pady=5)
+                row=4, column=0, sticky="ew", padx=(10, 5), pady=5)
             ttk.Button(frm, text="浏览...", command=self.browse_out).grid(
-                row=3, column=1, columnspan=2, padx=5, pady=5)
+                row=4, column=1, columnspan=3, padx=5, pady=5)
 
-            # 书名（可选）
-            ttk.Label(frm, text="③ 书名（可选，留空自动取标题）:").grid(
-                row=4, column=0, columnspan=3, sticky="w", **pad)
+            # ③ 书名（可选）
+            ttk.Label(frm, text="③ 书名（可选；仅单个输入时生效，批量自动取各文件标题）:").grid(
+                row=5, column=0, columnspan=4, sticky="w", **pad)
             self.title_var = tk.StringVar()
             ttk.Entry(frm, textvariable=self.title_var).grid(
-                row=5, column=0, columnspan=3, sticky="ew", padx=10, pady=5)
+                row=6, column=0, columnspan=4, sticky="ew", padx=10, pady=5)
 
             # 转换按钮
-            self.convert_btn = ttk.Button(frm, text="开始转换", command=self.start_convert)
-            self.convert_btn.grid(row=6, column=0, columnspan=3, pady=10)
+            self.convert_btn = ttk.Button(frm, text="开始批量转换", command=self.start_convert)
+            self.convert_btn.grid(row=7, column=0, columnspan=4, pady=10)
 
             # 进度
             self.progress = ttk.Progressbar(frm, mode="determinate", maximum=100)
-            self.progress.grid(row=7, column=0, columnspan=3, sticky="ew", padx=10, pady=5)
+            self.progress.grid(row=8, column=0, columnspan=4, sticky="ew", padx=10, pady=5)
             self.status_var = tk.StringVar(value="就绪")
             ttk.Label(frm, textvariable=self.status_var, anchor="w").grid(
-                row=8, column=0, columnspan=3, sticky="ew", padx=10, pady=5)
+                row=9, column=0, columnspan=4, sticky="ew", padx=10, pady=5)
 
             # 日志
-            ttk.Label(frm, text="运行日志:").grid(row=9, column=0, columnspan=3, sticky="w", **pad)
-            self.log_text = tk.Text(frm, height=10, state="disabled", wrap="word")
-            self.log_text.grid(row=10, column=0, columnspan=3, sticky="nsew", padx=10, pady=5)
-            scroll = ttk.Scrollbar(frm, command=self.log_text.yview)
-            scroll.grid(row=10, column=3, sticky="ns", pady=5)
-            self.log_text.config(yscrollcommand=scroll.set)
+            ttk.Label(frm, text="运行日志:").grid(row=10, column=0, columnspan=4, sticky="w", **pad)
+            self.log_text = tk.Text(frm, height=9, state="disabled", wrap="word")
+            self.log_text.grid(row=11, column=0, columnspan=3, sticky="nsew", padx=10, pady=5)
+            log_scroll = ttk.Scrollbar(frm, command=self.log_text.yview)
+            log_scroll.grid(row=11, column=3, sticky="ns", pady=5)
+            self.log_text.config(yscrollcommand=log_scroll.set)
 
-            frm.rowconfigure(10, weight=1)
+            frm.rowconfigure(11, weight=1)
             frm.columnconfigure(0, weight=1)
 
             self.root.protocol("WM_DELETE_WINDOW", self.on_close)
             self.root.after(100, self.poll_queue)
 
-        # ---- UI 辅助
+        # ---- 输入列表操作
         def browse_input(self):
-            p = filedialog.askopenfilename(title="选择本地 HTML 文件",
-                                           filetypes=[("网页文件", "*.html *.htm"), ("所有文件", "*.*")])
-            if p:
-                self.input_var.set(p)
+            ps = filedialog.askopenfilenames(title="选择本地 HTML 文件（可多选）",
+                                             filetypes=[("网页文件", "*.html *.htm"), ("所有文件", "*.*")])
+            for p in ps:
+                self.input_list.insert(tk.END, p)
+
+        def add_link(self):
+            """弹窗粘贴在线链接（每行一个）"""
+            win = tk.Toplevel(self.root)
+            win.title("添加在线链接")
+            win.geometry("540x240")
+            ttk.Label(win, text="粘贴 telegra.ph 链接（每行一个，可添加多个）:").pack(
+                anchor="w", padx=10, pady=(10, 5))
+            txt = tk.Text(win, height=6)
+            txt.pack(fill="both", expand=True, padx=10)
+
+            def ok():
+                for line in txt.get("1.0", tk.END).splitlines():
+                    line = line.strip()
+                    if line:
+                        self.input_list.insert(tk.END, line)
+                win.destroy()
+
+            def cancel():
+                win.destroy()
+
+            btns = ttk.Frame(win)
+            btns.pack(pady=8)
+            ttk.Button(btns, text="确定", command=ok).pack(side="left", padx=6)
+            ttk.Button(btns, text="取消", command=cancel).pack(side="left", padx=6)
+            txt.focus_set()
 
         def browse_dir_input(self):
-            """选择文件夹：自动尝试其中唯一的 HTML/无扩展名网页文件"""
+            """选择文件夹：扫描其中所有 Telegraph 网页文件并加入输入列表"""
             d = filedialog.askdirectory(title="选择包含漫画网页的文件夹")
             if not d:
                 return
-            cands = [os.path.join(d, f) for f in os.listdir(d)
-                     if os.path.isfile(os.path.join(d, f)) and
-                     (f.lower().endswith((".html", ".htm")) or "." not in f)]
-            if not cands:
-                messagebox.showwarning("提示", "该文件夹下未找到 HTML 或无扩展名网页文件")
+            try:
+                hits = scan_dir_for_html(d)
+            except Exception as e:
+                messagebox.showerror("错误", str(e))
                 return
-            if len(cands) == 1:
-                self.input_var.set(cands[0])
-            else:
-                # 多候选：询问用户
-                if TK_AVAILABLE:
-                    win = tk.Toplevel(self.root)
-                    win.title("选择文件")
-                    win.geometry("560x360")
-                    lb = tk.Listbox(win)
-                    for c in cands:
-                        lb.insert(tk.END, os.path.basename(c) or c)
-                    lb.pack(fill="both", expand=True, padx=10, pady=10)
+            if not hits:
+                messagebox.showwarning("提示",
+                                       "该文件夹下未找到 Telegraph 网页文件\n"
+                                       "（.html/.htm 或无扩展名，且文件名含 telegraph 或内容含 telegra.ph）")
+                return
+            for h in hits:
+                self.input_list.insert(tk.END, h)
+            messagebox.showinfo("提示", "已添加 %d 个文件到输入列表" % len(hits))
 
-                    def pick():
-                        sel = lb.curselection()
-                        if sel:
-                            self.input_var.set(cands[sel[0]])
-                        win.destroy()
+        def remove_selected(self):
+            sel = self.input_list.curselection()
+            for idx in reversed(sel):
+                self.input_list.delete(idx)
 
-                    ttk.Button(win, text="确定", command=pick).pack(pady=5)
+        def clear_inputs(self):
+            self.input_list.delete(0, tk.END)
 
         def browse_out(self):
             d = filedialog.askdirectory(title="选择输出目录")
@@ -561,13 +671,29 @@ if TK_AVAILABLE:
                         self.status_var.set(msg)
                     elif kind == "log":
                         self.append_log(payload)
-                    elif kind == "done":
-                        out_path = payload
+                    elif kind == "batch_done":
+                        results, out_dir = payload
+                        ok = [r for r in results if r[1]]
+                        fail = [r for r in results if not r[1]]
                         self.convert_btn.config(state="normal")
-                        self.status_var.set("转换完成：" + out_path)
-                        if messagebox.askyesno("转换完成",
-                                               "EPUB 已生成：\n%s\n\n是否立即打开文件？" % out_path):
-                            self.open_file(out_path)
+                        self.progress["value"] = 100
+                        self.status_var.set("批量转换完成：成功 %d，失败 %d" % (len(ok), len(fail)))
+                        if fail:
+                            msg = "成功 %d / %d，失败 %d：\n" % (len(ok), len(results), len(fail))
+                            for inp, _, err in fail:
+                                msg += "\n✗ %s\n   原因: %s" % (inp, err)
+                            messagebox.showwarning("批量转换完成（部分失败）", msg)
+                        if ok:
+                            if len(ok) == 1 and len(results) == 1:
+                                if messagebox.askyesno("转换完成",
+                                                       "EPUB 已生成：\n%s\n\n是否立即打开文件？" % ok[0][2]):
+                                    self.open_file(ok[0][2])
+                            else:
+                                if messagebox.askyesno(
+                                        "转换完成",
+                                        "成功生成 %d 个 EPUB（输出目录：\n%s）\n\n是否打开输出目录？"
+                                        % (len(ok), out_dir)):
+                                    self.open_dir(out_dir)
                     elif kind == "error":
                         err = payload
                         self.convert_btn.config(state="normal")
@@ -591,35 +717,56 @@ if TK_AVAILABLE:
             except Exception as e:
                 messagebox.showwarning("提示", "无法自动打开文件：%s" % e)
 
+        @staticmethod
+        def open_dir(path):
+            try:
+                if sys.platform.startswith("win"):
+                    os.startfile(path)  # noqa
+                elif sys.platform == "darwin":
+                    import subprocess
+                    subprocess.Popen(["open", path])
+                else:
+                    import subprocess
+                    subprocess.Popen(["xdg-open", path])
+            except Exception as e:
+                messagebox.showwarning("提示", "无法自动打开目录：%s" % e)
+
         # ---- 转换
         def start_convert(self):
             if self.worker and self.worker.is_alive():
                 messagebox.showinfo("提示", "正在转换中，请稍候")
                 return
-            inp = self.input_var.get().strip()
+            inputs = [s.strip() for s in self.input_list.get(0, tk.END) if s.strip()]
             out_dir = self.out_var.get().strip() or os.path.join(os.path.expanduser("~"), "Downloads")
             title = self.title_var.get().strip()
-            if not inp:
-                messagebox.showwarning("提示", "请先输入 telegra.ph 链接或本地文件路径")
+            if not inputs:
+                messagebox.showwarning("提示", "请先添加至少一个输入（链接 / 文件 / 文件夹扫描）")
                 return
             self.convert_btn.config(state="disabled")
             self.progress["value"] = 0
             self.status_var.set("开始 ...")
-            self.append_log("== 开始转换 ==")
-            self.append_log("输入: %s" % inp)
+            self.append_log("== 开始批量转换 ==")
+            self.append_log("输入 %d 项:" % len(inputs))
+            for i, s in enumerate(inputs, 1):
+                self.append_log("  %d. %s" % (i, s))
+            self.append_log("输出目录: %s" % out_dir)
+            if len(inputs) > 1 and title:
+                self.append_log("[提示] 批量模式自动取各文件标题，书名栏仅对单输入生效")
             self.worker = threading.Thread(
-                target=self._run, args=(inp, out_dir, title), daemon=True)
+                target=self._run, args=(inputs, out_dir, title), daemon=True)
             self.worker.start()
 
-        def _run(self, inp, out_dir, title):
+        def _run(self, inputs, out_dir, title):
             def cb(pct, msg):
                 self.queue.put(("progress", (pct, msg)))
-                self.queue.put(("log", msg))
+
             def log_only(msg):
                 self.queue.put(("log", msg))
+
             try:
-                out_path = convert(inp, out_dir, title=title, progress_cb=cb, log_cb=log_only)
-                self.queue.put(("done", out_path))
+                results = convert_batch(inputs, out_dir, title=title,
+                                        progress_cb=cb, log_cb=log_only)
+                self.queue.put(("batch_done", (results, out_dir)))
             except Exception as e:
                 self.queue.put(("error", e))
 
@@ -630,8 +777,15 @@ if TK_AVAILABLE:
 # ---------------------------------------------------------------- 主入口
 
 def run_cli(argv):
-    """命令行模式：--cli <输入> [--out 目录] [--title 书名]"""
+    """命令行模式（支持批量）：
+
+      单输入  : --cli <链接或路径> [--out 目录] [--title 书名]
+      多输入  : --cli <输入1> <输入2> ... [--out 目录]
+      扫文件夹: --cli --dir <文件夹> [--out 目录]
+      组合    : --cli <输入1> --dir <文件夹> ... [--out 目录]
+    """
     args = list(argv)
+
     def take(flag):
         nonlocal args
         if flag in args:
@@ -640,21 +794,43 @@ def run_cli(argv):
             return args.pop(i)
         return None
 
-    if "--cli" in args:
-        args.remove("--cli")
-    inp = args[0] if args else None
+    dirs = []
+    while True:
+        d = take("--dir")
+        if d is None:
+            break
+        dirs.append(d)
     out_dir = take("--out") or os.path.join(os.path.expanduser("~"), "Downloads")
     title = take("--title")
-    if not inp:
-        log("用法: python telegraph-epub-converter.py --cli <链接或路径> [--out 目录] [--title 书名]")
+
+    inputs = [a for a in args if a.strip() and not a.startswith("--")]
+    for d in dirs:
+        inputs.extend(scan_dir_for_html(d))
+
+    if not inputs:
+        log("用法:")
+        log("  单输入  : python telegraph-epub-converter.py --cli <链接或路径> [--out 目录] [--title 书名]")
+        log("  多输入  : python telegraph-epub-converter.py --cli <输入1> <输入2> ... [--out 目录]")
+        log("  扫文件夹: python telegraph-epub-converter.py --cli --dir <文件夹> [--out 目录]")
+        log("  组合    : python telegraph-epub-converter.py --cli <输入1> --dir <文件夹> ... [--out 目录]")
         return 1
 
-    log("输入: %s" % inp)
+    log("输入 %d 项:" % len(inputs))
+    for i, inp in enumerate(inputs, 1):
+        log("  %d. %s" % (i, inp))
     log("输出目录: %s" % out_dir)
-    out_path = convert(inp, out_dir, title=title, progress_cb=None, log_cb=log)
+    if len(inputs) > 1 and title:
+        log("[提示] 批量模式自动取各文件标题，--title 仅对单输入生效")
+
+    results = convert_batch(inputs, out_dir, title=title, log_cb=log)
+    failed = [(i, d) for i, ok, d in results if not ok]
     log("")
-    log("转换成功！EPUB 已生成：")
-    log(out_path)
+    if failed:
+        log("以下 %d 项转换失败：" % len(failed))
+        for i, err in failed:
+            log("  - %s" % i)
+            log("    原因: %s" % err)
+        return 2
     return 0
 
 
@@ -664,6 +840,7 @@ def main():
     if not TK_AVAILABLE:
         log("当前环境无图形界面，请使用命令行模式：")
         log("python telegraph-epub-converter.py --cli <链接或路径> [--out 目录] [--title 书名]")
+        log("或批量模式：--cli 输入1 输入2 ... / --cli --dir 文件夹")
         return 1
     root = tk.Tk()
     ConverterApp(root)
