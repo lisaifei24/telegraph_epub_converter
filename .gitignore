@@ -1,0 +1,32 @@
+﻿# Python 编译产物
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 构建 / 打包产物
+build/
+dist/
+*.egg-info/
+*.egg
+
+# 日志与临时文件
+*.log
+*.tmp
