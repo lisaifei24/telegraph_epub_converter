@@ -13,29 +13,42 @@ telegra.ph 漫画网页一键转 EPUB 电子书工具（tkinter GUI + CLI，支�
   4. 纯标准库实现：urllib 下载、zipfile 手写 EPUB3（OPF/XHTML/NCX），零第三方依赖
   5. 批量转换：
      - GUI：输入列表支持添加多条（文件多选 / 在线链接 / 扫描文件夹），
-            可增删、清空，逐个转换并汇总成功 / 失败结果
-     - CLI：--cli 后接多个输入参数，或 --dir 扫描文件夹内所有 Telegraph 网页文件，
-            逐个转换并输出汇总统计
+            可增删、清空，逐个转换并汇总成功 / 失败 / 取消结果
+     - CLI：--cli 后接多个输入参数，或 --dir 扫描文件夹内所有 Telegraph 网页文件
+  6. 并发下载图片：ThreadPoolExecutor 多线程，默认 6 路并发（--jobs / GUI 可调 1-16），
+     下载完成后按页面顺序写入 EPUB，图片顺序稳定
+  7. 暂停 / 继续：GUI 按钮一键暂停下载与打包、随时继续；CLI 按 Ctrl+Break 切换暂停
+  8. 取消：GUI 按钮一键取消当前及后续任务；CLI 按 Ctrl+C 优雅取消。
+     取消后自动清理临时文件：已完成的转换保留输出，未完成的标记为"已取消"
 
 用法：
-  * 双击脚本 → 弹出 GUI，通过"添加文件 / 添加链接 / 添加文件夹"建立输入列表后批量转换
+  * 双击脚本 → 弹出 GUI，通过"添加文件 / 添加链接 / 添加文件夹"建立输入列表后批量转换；
+    转换中可用"暂停/继续"与"取消"按钮控制
   * 命令行（无界面）：
-      单输入  : python telegraph-epub-converter.py --cli <本地路径或在线链接> [--out <输出目录>] [--title <书名>]
+      单输入  : python telegraph-epub-converter.py --cli <本地路径或在线链接> [--out <输出目录>] [--title <书名>] [--jobs <1-16>]
       多输入  : python telegraph-epub-converter.py --cli <输入1> <输入2> ... [--out <输出目录>]
       扫文件夹: python telegraph-epub-converter.py --cli --dir <文件夹> [--out <输出目录>]
       组合    : python telegraph-epub-converter.py --cli <输入1> --dir <文件夹> ... [--out <输出目录>]
+    转换中：Ctrl+C 取消，Ctrl+Break 暂停/继续（Windows）
 """
 
 import os
 import re
 import sys
+import time
+import socket
 import html as html_mod
 import urllib.request
+from urllib.error import URLError
 import datetime
 import zipfile
 import threading
 import queue
 import tempfile
+import shutil
+import signal
+import time
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 try:
     import tkinter as tk
@@ -55,6 +68,30 @@ UA = {
 }
 TIMEOUT = 60
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+DEFAULT_CONCURRENCY = 6      # 默认并发下载线程数
+MAX_CONCURRENCY = 16         # 并发数上限
+MIN_CONCURRENCY = 1
+
+
+class DownloadCancelledError(Exception):
+    """用户取消转换时抛出"""
+
+
+# ---------------------------------------------------------------- 控制辅助
+
+def wait_resume(pause_event, cancel_event):
+    """等待暂停解除（可被取消中断）。暂停期间轮询，取消信号可立即生效。"""
+    while pause_event is not None and not pause_event.is_set():
+        if cancel_event is not None and cancel_event.is_set():
+            raise DownloadCancelledError("用户已取消")
+        time.sleep(0.2)
+
+
+def check_control(pause_event, cancel_event):
+    """下载 / 打包循环中的暂停与取消检查点"""
+    if cancel_event is not None and cancel_event.is_set():
+        raise DownloadCancelledError("用户已取消")
+    wait_resume(pause_event, cancel_event)
 
 
 # ---------------------------------------------------------------- 网络 / 解析
@@ -68,11 +105,21 @@ def log(msg):
         pass
 
 
-def fetch(url, timeout=TIMEOUT):
-    """下载 URL 内容（bytes）"""
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+def fetch(url, timeout=TIMEOUT, retries=3):
+    """下载 URL 内容（bytes）。瞬时网络错误自动重试（默认 3 次，逐步退避），最终失败抛出最后一次异常"""
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=UA)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except DownloadCancelledError:
+            raise
+        except (URLError, OSError, socket.timeout) as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(0.3 * attempt)
+    raise last_err
 
 
 def decode_html(data):
@@ -144,6 +191,90 @@ def load_html(src_type, url, file_path):
         return f.read()
 
 
+# ---------------------------------------------------------------- 并发下载
+
+def download_images_concurrently(img_urls, tmp_dir, concurrency=DEFAULT_CONCURRENCY,
+                                 progress_cb=None, pause_event=None, cancel_event=None):
+    """并发下载全部图片，返回按页面顺序排列的本地路径列表。
+
+    - 使用 ThreadPoolExecutor 滑动窗口调度，并发数 = concurrency（1-16）
+    - 下载结果按原顺序放入 img_paths，保证 EPUB 页面顺序稳定
+    - 暂停：pause_event 未设置时阻塞等待（可被取消中断）
+    - 取消：cancel_event 设置时取消未启动任务并抛出 DownloadCancelledError
+    - 任一张图片失败：取消其余未完成任务并抛出原始异常（由上层记录失败）
+    """
+    total = len(img_urls)
+    if total == 0:
+        return []
+
+    exts = []
+    for u in img_urls:
+        ext = os.path.splitext(u.split("?")[0])[1].lower() or ".jpg"
+        if ext not in IMG_EXTS:
+            ext = ".jpg"
+        exts.append(ext)
+
+    def dest_path(i):
+        return os.path.join(tmp_dir, "page_%03d%s" % (i, exts[i - 1]))
+
+    img_paths = [None] * total
+    next_idx = 0
+    futures = {}
+    done = 0
+    pool = ThreadPoolExecutor(max_workers=concurrency)
+
+    def submit_next():
+        nonlocal next_idx
+        if next_idx < total:
+            i = next_idx + 1
+            fut = pool.submit(download_image, img_urls[i - 1], dest_path(i))
+            futures[fut] = i
+            next_idx += 1
+
+    cancelled = False
+    try:
+        for _ in range(min(concurrency, total)):
+            submit_next()
+        while futures:
+            check_control(pause_event, cancel_event)
+            finished, _ = wait(futures, return_when=FIRST_COMPLETED, timeout=0.2)
+            for f in finished:
+                i = futures.pop(f)
+                try:
+                    size = f.result()
+                    if size <= 0:
+                        raise RuntimeError("图片 %d 下载失败（0 字节）: %s" % (i, img_urls[i - 1]))
+                    img_paths[i - 1] = dest_path(i)
+                except DownloadCancelledError:
+                    raise
+                except Exception:
+                    cancelled = True
+                    for g in futures:
+                        g.cancel()
+                    raise
+                done += 1
+                if progress_cb:
+                    progress_cb(6 + int(58.0 * done / total), "下载图片 %d/%d ..." % (done, total))
+            while len(futures) < concurrency and next_idx < total:
+                submit_next()
+    except DownloadCancelledError:
+        cancelled = True
+        for g in futures:
+            g.cancel()
+        raise
+    finally:
+        # 取消/失败时也等待已启动的下载任务结束，确保临时目录可干净清理
+        # （cancel_futures=True 会取消未启动任务；运行中的任务让其在当前批内完成）
+        if cancelled:
+            try:
+                pool.shutdown(wait=True, cancel_futures=True)
+            except TypeError:  # Python < 3.9
+                pool.shutdown(wait=False)
+        else:
+            pool.shutdown(wait=True)
+    return img_paths
+
+
 # ---------------------------------------------------------------- EPUB 生成（纯标准库）
 
 def media_type(ext):
@@ -187,7 +318,7 @@ def build_ncx(title, epub_id, page_count):
     )
 
 
-def build_epub(images, title, out_path, progress_cb=None):
+def build_epub(images, title, out_path, progress_cb=None, pause_event=None, cancel_event=None):
     """手写 EPUB3（含 NCX 兼容老阅读器），逐页排版漫画图片。
 
     images: 本地图片绝对路径列表（已按页面顺序）
@@ -235,10 +366,12 @@ def build_epub(images, title, out_path, progress_cb=None):
 
     # 3) 每页 XHTML
     for i, ext in enumerate(ext_by_path, 1):
+        check_control(pause_event, cancel_event)
         xhtml = build_page_xhtml(title, i, "images/page_%03d%s" % (i, ext))
         file_specs.append(("EPUB/page_%03d.xhtml" % i, xhtml.encode("utf-8"), zipfile.ZIP_DEFLATED))
 
     # 4) 封面 XHTML（第一页图片）
+    check_control(pause_event, cancel_event)
     cover_xhtml = (
         '<?xml version="1.0" encoding="utf-8"?>\n'
         '<!DOCTYPE html>\n'
@@ -253,6 +386,7 @@ def build_epub(images, title, out_path, progress_cb=None):
     file_specs.append(("EPUB/cover.xhtml", cover_xhtml.encode("utf-8"), zipfile.ZIP_DEFLATED))
 
     # 5) nav.xhtml（EPUB3 目录导航）
+    check_control(pause_event, cancel_event)
     nav_entries = "".join(
         '<li><a href="page_%03d.xhtml">第 %d 页</a></li>' % (i, i)
         for i in range(1, page_count + 1)
@@ -273,10 +407,12 @@ def build_epub(images, title, out_path, progress_cb=None):
     file_specs.append(("EPUB/nav.xhtml", nav_xhtml.encode("utf-8"), zipfile.ZIP_DEFLATED))
 
     # 6) toc.ncx（EPUB2 兼容）
+    check_control(pause_event, cancel_event)
     file_specs.append(("EPUB/toc.ncx", build_ncx(title, epub_id, page_count).encode("utf-8"),
                        zipfile.ZIP_DEFLATED))
 
     # 7) content.opf（清单 + 书脊）
+    check_control(pause_event, cancel_event)
     manifest_items = []
     manifest_items.append('<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>')
     manifest_items.append('<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>')
@@ -317,8 +453,10 @@ def build_epub(images, title, out_path, progress_cb=None):
     # 8) 图片文件
     report(10, "写入页面与图片文件 ...")
     for i, (img_path, ext) in enumerate(zip(images, ext_by_path), 1):
+        check_control(pause_event, cancel_event)
         with open(img_path, "rb") as f:
             file_specs.append(("EPUB/images/page_%03d%s" % (i, ext), f.read(), zipfile.ZIP_DEFLATED))
+    check_control(pause_event, cancel_event)
     with open(images[0], "rb") as f:
         file_specs.append(("EPUB/images/cover%s" % cover_ext, f.read(), zipfile.ZIP_DEFLATED))
 
@@ -326,6 +464,7 @@ def build_epub(images, title, out_path, progress_cb=None):
     report(60, "压缩写入 EPUB ...")
     with zipfile.ZipFile(out_path, "w") as zf:
         for arcname, data, compress in file_specs:
+            check_control(pause_event, cancel_event)
             zf.writestr(arcname, data, compress_type=compress)
 
     # 10) 结构校验
@@ -373,8 +512,12 @@ def validate_epub(epub_path, page_count, ext_by_path):
 
 # ---------------------------------------------------------------- 主转换流程
 
-def convert(input_raw, out_dir, title=None, progress_cb=None, log_cb=None):
-    """一键转换入口：解析输入 -> 取页面 -> 提取图片 -> 下载 -> 生成 EPUB -> 校验"""
+def convert(input_raw, out_dir, title=None, progress_cb=None, log_cb=None,
+            concurrency=DEFAULT_CONCURRENCY, pause_event=None, cancel_event=None):
+    """一键转换入口：解析输入 -> 取页面 -> 提取图片 -> 并发下载 -> 生成 EPUB -> 校验。
+
+    取消（DownloadCancelledError）时自动清理临时目录；其余异常同样清理后抛出。
+    """
     out_dir = os.path.abspath(os.path.expanduser(out_dir))
     os.makedirs(out_dir, exist_ok=True)
 
@@ -407,32 +550,29 @@ def convert(input_raw, out_dir, title=None, progress_cb=None, log_cb=None):
         raise ValueError("页面中未找到任何漫画图片，请确认输入的是 telegra.ph 漫画网页")
     emit(5, "共提取到 %d 张漫画图片" % len(img_urls))
 
-    # 3) 下载图片到临时目录
+    # 3) 并发下载图片到临时目录（取消 / 异常时清理）
     tmp_dir = tempfile.mkdtemp(prefix="telegraph_epub_")
-    img_paths = []
-    for i, u in enumerate(img_urls, 1):
-        ext = os.path.splitext(u.split("?")[0])[1].lower() or ".jpg"
-        if ext not in IMG_EXTS:
-            ext = ".jpg"
-        dest = os.path.join(tmp_dir, "page_%03d%s" % (i, ext))
-        emit(6 + int(58.0 * i / len(img_urls)),
-             "下载图片 %d/%d ..." % (i, len(img_urls)))
-        size = download_image(u, dest)
-        if size <= 0:
-            raise RuntimeError("图片 %d 下载失败（0 字节）: %s" % (i, u))
-        img_paths.append(dest)
+    try:
+        emit(6, "开始并发下载图片（并发 %d）..." % concurrency)
+        img_paths = download_images_concurrently(
+            img_urls, tmp_dir, concurrency=concurrency,
+            progress_cb=lambda pct, m: emit(pct, m),
+            pause_event=pause_event, cancel_event=cancel_event)
 
-    # 4) 生成 EPUB
-    out_name = sanitize_filename(title) + ".epub"
-    out_path = os.path.join(out_dir, out_name)
-    if os.path.exists(out_path):  # 避免覆盖
-        n = 1
-        while os.path.exists(os.path.join(out_dir, "%s_%d.epub" % (sanitize_filename(title), n))):
-            n += 1
-        out_path = os.path.join(out_dir, "%s_%d.epub" % (sanitize_filename(title), n))
+        # 4) 生成 EPUB
+        out_name = sanitize_filename(title) + ".epub"
+        out_path = os.path.join(out_dir, out_name)
+        if os.path.exists(out_path):  # 避免覆盖
+            n = 1
+            while os.path.exists(os.path.join(out_dir, "%s_%d.epub" % (sanitize_filename(title), n))):
+                n += 1
+            out_path = os.path.join(out_dir, "%s_%d.epub" % (sanitize_filename(title), n))
 
-    emit(65, "生成 EPUB：%s" % os.path.basename(out_path))
-    build_epub(img_paths, title, out_path, progress_cb=emit)
+        emit(65, "生成 EPUB：%s" % os.path.basename(out_path))
+        build_epub(img_paths, title, out_path, progress_cb=emit,
+                   pause_event=pause_event, cancel_event=cancel_event)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     return out_path
 
 
@@ -470,16 +610,37 @@ def scan_dir_for_html(dir_path):
     return hits
 
 
-def convert_batch(inputs, out_dir, title=None, progress_cb=None, log_cb=None):
+def convert_batch(inputs, out_dir, title=None, progress_cb=None, log_cb=None,
+                  concurrency=DEFAULT_CONCURRENCY, pause_event=None, cancel_event=None):
     """批量转换入口：逐个转换并汇总结果。
 
     inputs: 输入列表（本地路径 / 在线链接均可）
     title : 仅在单输入时生效；批量时自动取各文件标题
-    返回 [(input, ok, detail)]，detail 为输出路径（成功）或错误信息（失败）。
+    返回 [(input, ok, detail)]，detail 为输出路径（成功）、错误信息（失败）或"已取消"。
+    暂停 / 取消对后续任务同样生效：取消时未开始项直接标记"已取消"。
     """
     total = len(inputs)
     results = []
+    line = (lambda m: log_cb(m)) if log_cb else (lambda m: None)
+
+    def finish_summary():
+        ok = sum(1 for _, ok_, _ in results if ok_)
+        fail = sum(1 for _, ok_, d in results if not ok_ and d != "已取消")
+        canc = sum(1 for _, ok_, d in results if d == "已取消")
+        line("")
+        line("批量转换完成：成功 %d，失败 %d，取消 %d" % (ok, fail, canc))
+        return results
+
     for idx, inp in enumerate(inputs, 1):
+        # 任务开始前的暂停 / 取消检查
+        try:
+            wait_resume(pause_event, cancel_event)
+        except DownloadCancelledError:
+            for inp2 in inputs[idx - 1:]:
+                results.append((inp2, False, "已取消"))
+            line("[取消] 用户取消，剩余 %d 项未执行" % (total - idx + 1))
+            return finish_summary()
+
         base = (idx - 1) * 100.0 / total
         span = 100.0 / total
 
@@ -489,25 +650,27 @@ def convert_batch(inputs, out_dir, title=None, progress_cb=None, log_cb=None):
                     progress_cb(int(base + span * pct), msg)
             return cb
 
-        def line(msg):
-            if log_cb:
-                log_cb(msg)
-
         line("")
         line("[%d/%d] 开始转换：%s" % (idx, total, inp))
         try:
             out_path = convert(inp, out_dir,
                                title=title if total == 1 else None,
-                               progress_cb=make_progress(), log_cb=line)
+                               progress_cb=make_progress(), log_cb=line,
+                               concurrency=concurrency,
+                               pause_event=pause_event, cancel_event=cancel_event)
             results.append((inp, True, out_path))
             line("[%d/%d] 成功：%s" % (idx, total, out_path))
+        except DownloadCancelledError:
+            results.append((inp, False, "已取消"))
+            line("[%d/%d] 取消：%s" % (idx, total, inp))
+            for inp2 in inputs[idx:]:
+                results.append((inp2, False, "已取消"))
+            line("[取消] 当前及后续任务已取消")
+            return finish_summary()
         except Exception as e:
             results.append((inp, False, str(e)))
             line("[%d/%d] 失败：%s" % (idx, total, e))
-    ok_count = sum(1 for _, ok, _ in results if ok)
-    line("")
-    line("批量转换完成：成功 %d / %d，失败 %d" % (ok_count, total, total - ok_count))
-    return results
+    return finish_summary()
 
 
 # ---------------------------------------------------------------- GUI
@@ -515,16 +678,19 @@ def convert_batch(inputs, out_dir, title=None, progress_cb=None, log_cb=None):
 if TK_AVAILABLE:
 
     class ConverterApp:
-        """简洁 tkinter 交互界面（支持批量输入列表）"""
+        """简洁 tkinter 交互界面（批量输入 + 并发下载 + 暂停/取消）"""
 
         def __init__(self, root):
             self.root = root
             self.queue = queue.Queue()
             self.worker = None
+            self.pause_event = threading.Event()
+            self.pause_event.set()
+            self.cancel_event = threading.Event()
 
-            root.title("telegra.ph 漫画 → EPUB 转换器（批量）")
-            root.geometry("700x620")
-            root.minsize(620, 540)
+            root.title("telegra.ph 漫画 → EPUB 转换器（批量 / 并发）")
+            root.geometry("720x660")
+            root.minsize(640, 560)
 
             pad = {"padx": 10, "pady": 5}
             frm = ttk.Frame(root, padding=10)
@@ -564,9 +730,21 @@ if TK_AVAILABLE:
             ttk.Entry(frm, textvariable=self.title_var).grid(
                 row=6, column=0, columnspan=4, sticky="ew", padx=10, pady=5)
 
-            # 转换按钮
-            self.convert_btn = ttk.Button(frm, text="开始批量转换", command=self.start_convert)
-            self.convert_btn.grid(row=7, column=0, columnspan=4, pady=10)
+            # 转换按钮 + 并发数 + 暂停/取消
+            ctrl_frame = ttk.Frame(frm)
+            ctrl_frame.grid(row=7, column=0, columnspan=4, pady=8)
+            self.convert_btn = ttk.Button(ctrl_frame, text="开始批量转换", command=self.start_convert)
+            self.convert_btn.pack(side="left", padx=4)
+            ttk.Label(ctrl_frame, text="并发:").pack(side="left", padx=(14, 2))
+            self.jobs_var = tk.IntVar(value=DEFAULT_CONCURRENCY)
+            ttk.Spinbox(ctrl_frame, from_=MIN_CONCURRENCY, to=MAX_CONCURRENCY, width=4,
+                        textvariable=self.jobs_var).pack(side="left")
+            self.pause_btn = ttk.Button(ctrl_frame, text="暂停", command=self.on_pause_toggle,
+                                        state="disabled")
+            self.pause_btn.pack(side="left", padx=4)
+            self.cancel_btn = ttk.Button(ctrl_frame, text="取消", command=self.on_cancel,
+                                         state="disabled")
+            self.cancel_btn.pack(side="left", padx=4)
 
             # 进度
             self.progress = ttk.Progressbar(frm, mode="determinate", maximum=100)
@@ -654,6 +832,23 @@ if TK_AVAILABLE:
             if d:
                 self.out_var.set(d)
 
+        # ---- 控制（暂停/继续、取消）
+        def on_pause_toggle(self):
+            if self.pause_event.is_set():
+                self.pause_event.clear()
+                self.pause_btn.config(text="继续")
+                self.append_log("[暂停] 已暂停，下载与打包将等待，点击「继续」恢复")
+            else:
+                self.pause_event.set()
+                self.pause_btn.config(text="暂停")
+                self.append_log("[继续] 已继续")
+
+        def on_cancel(self):
+            self.cancel_event.set()
+            self.cancel_btn.config(state="disabled")
+            self.status_var.set("正在取消...")
+            self.append_log("[取消] 用户请求取消，正在停止下载与后续任务...")
+
         # ---- 日志与进度
         def append_log(self, msg):
             self.log_text.config(state="normal")
@@ -674,12 +869,16 @@ if TK_AVAILABLE:
                     elif kind == "batch_done":
                         results, out_dir = payload
                         ok = [r for r in results if r[1]]
-                        fail = [r for r in results if not r[1]]
+                        fail = [r for r in results if not r[1] and r[2] != "已取消"]
+                        canc = [r for r in results if r[2] == "已取消"]
                         self.convert_btn.config(state="normal")
-                        self.progress["value"] = 100
-                        self.status_var.set("批量转换完成：成功 %d，失败 %d" % (len(ok), len(fail)))
+                        self.pause_btn.config(state="disabled", text="暂停")
+                        self.cancel_btn.config(state="disabled")
+                        self.pause_event.set()
+                        self.status_var.set("批量转换完成：成功 %d，失败 %d，取消 %d"
+                                            % (len(ok), len(fail), len(canc)))
                         if fail:
-                            msg = "成功 %d / %d，失败 %d：\n" % (len(ok), len(results), len(fail))
+                            msg = "成功 %d / 失败 %d / 取消 %d：\n" % (len(ok), len(fail), len(canc))
                             for inp, _, err in fail:
                                 msg += "\n✗ %s\n   原因: %s" % (inp, err)
                             messagebox.showwarning("批量转换完成（部分失败）", msg)
@@ -697,6 +896,9 @@ if TK_AVAILABLE:
                     elif kind == "error":
                         err = payload
                         self.convert_btn.config(state="normal")
+                        self.pause_btn.config(state="disabled", text="暂停")
+                        self.cancel_btn.config(state="disabled")
+                        self.pause_event.set()
                         self.status_var.set("转换失败")
                         messagebox.showerror("转换失败", str(err))
             except queue.Empty:
@@ -742,7 +944,16 @@ if TK_AVAILABLE:
             if not inputs:
                 messagebox.showwarning("提示", "请先添加至少一个输入（链接 / 文件 / 文件夹扫描）")
                 return
+            try:
+                jobs = max(MIN_CONCURRENCY, min(MAX_CONCURRENCY, int(self.jobs_var.get())))
+            except (TypeError, ValueError):
+                jobs = DEFAULT_CONCURRENCY
+            self.pause_event = threading.Event()
+            self.pause_event.set()
+            self.cancel_event = threading.Event()
             self.convert_btn.config(state="disabled")
+            self.pause_btn.config(state="normal", text="暂停")
+            self.cancel_btn.config(state="normal")
             self.progress["value"] = 0
             self.status_var.set("开始 ...")
             self.append_log("== 开始批量转换 ==")
@@ -750,13 +961,14 @@ if TK_AVAILABLE:
             for i, s in enumerate(inputs, 1):
                 self.append_log("  %d. %s" % (i, s))
             self.append_log("输出目录: %s" % out_dir)
+            self.append_log("并发下载: %d 线程" % jobs)
             if len(inputs) > 1 and title:
                 self.append_log("[提示] 批量模式自动取各文件标题，书名栏仅对单输入生效")
             self.worker = threading.Thread(
-                target=self._run, args=(inputs, out_dir, title), daemon=True)
+                target=self._run, args=(inputs, out_dir, title, jobs), daemon=True)
             self.worker.start()
 
-        def _run(self, inputs, out_dir, title):
+        def _run(self, inputs, out_dir, title, jobs):
             def cb(pct, msg):
                 self.queue.put(("progress", (pct, msg)))
 
@@ -765,7 +977,10 @@ if TK_AVAILABLE:
 
             try:
                 results = convert_batch(inputs, out_dir, title=title,
-                                        progress_cb=cb, log_cb=log_only)
+                                        progress_cb=cb, log_cb=log_only,
+                                        concurrency=jobs,
+                                        pause_event=self.pause_event,
+                                        cancel_event=self.cancel_event)
                 self.queue.put(("batch_done", (results, out_dir)))
             except Exception as e:
                 self.queue.put(("error", e))
@@ -777,12 +992,16 @@ if TK_AVAILABLE:
 # ---------------------------------------------------------------- 主入口
 
 def run_cli(argv):
-    """命令行模式（支持批量）：
+    """命令行模式（支持批量 / 并发 / 暂停 / 取消）：
 
-      单输入  : --cli <链接或路径> [--out 目录] [--title 书名]
+      单输入  : --cli <链接或路径> [--out 目录] [--title 书名] [--jobs 1-16]
       多输入  : --cli <输入1> <输入2> ... [--out 目录]
       扫文件夹: --cli --dir <文件夹> [--out 目录]
       组合    : --cli <输入1> --dir <文件夹> ... [--out 目录]
+
+    转换中控制信号（Windows）：
+      Ctrl+C    → 优雅取消（清理临时文件，已完成保留、未完成标记取消）
+      Ctrl+Break→ 暂停 / 继续切换
     """
     args = list(argv)
 
@@ -802,6 +1021,13 @@ def run_cli(argv):
         dirs.append(d)
     out_dir = take("--out") or os.path.join(os.path.expanduser("~"), "Downloads")
     title = take("--title")
+    jobs_str = take("--jobs")
+    concurrency = DEFAULT_CONCURRENCY
+    if jobs_str:
+        try:
+            concurrency = max(MIN_CONCURRENCY, min(MAX_CONCURRENCY, int(jobs_str)))
+        except ValueError:
+            log("[提示] --jobs 参数无效，使用默认 %d" % DEFAULT_CONCURRENCY)
 
     inputs = [a for a in args if a.strip() and not a.startswith("--")]
     for d in dirs:
@@ -809,28 +1035,70 @@ def run_cli(argv):
 
     if not inputs:
         log("用法:")
-        log("  单输入  : python telegraph-epub-converter.py --cli <链接或路径> [--out 目录] [--title 书名]")
+        log("  单输入  : python telegraph-epub-converter.py --cli <链接或路径> [--out 目录] [--title 书名] [--jobs 1-16]")
         log("  多输入  : python telegraph-epub-converter.py --cli <输入1> <输入2> ... [--out 目录]")
         log("  扫文件夹: python telegraph-epub-converter.py --cli --dir <文件夹> [--out 目录]")
         log("  组合    : python telegraph-epub-converter.py --cli <输入1> --dir <文件夹> ... [--out 目录]")
+        log("转换中：Ctrl+C 取消，Ctrl+Break 暂停/继续")
         return 1
+
+    # 控制事件与信号
+    pause_event = threading.Event()
+    pause_event.set()
+    cancel_event = threading.Event()
+
+    def toggle_pause(signum=None, frame=None):
+        if pause_event.is_set():
+            pause_event.clear()
+            log("[暂停] 已暂停（下载/打包等待中），按 Ctrl+Break 继续")
+        else:
+            pause_event.set()
+            log("[继续] 已继续")
+
+    def do_cancel(signum=None, frame=None):
+        cancel_event.set()
+        log("[取消] 收到取消信号，正在优雅停止...")
+
+    try:
+        signal.signal(signal.SIGINT, do_cancel)
+    except Exception:
+        pass
+    if sys.platform == "win32":
+        try:
+            signal.signal(signal.SIGBREAK, toggle_pause)
+        except Exception:
+            pass
+    else:
+        try:
+            signal.signal(signal.SIGTSTP, toggle_pause)
+        except Exception:
+            pass
 
     log("输入 %d 项:" % len(inputs))
     for i, inp in enumerate(inputs, 1):
         log("  %d. %s" % (i, inp))
     log("输出目录: %s" % out_dir)
+    log("并发下载: %d 线程（Ctrl+C 取消，Ctrl+Break 暂停/继续）" % concurrency)
     if len(inputs) > 1 and title:
         log("[提示] 批量模式自动取各文件标题，--title 仅对单输入生效")
 
-    results = convert_batch(inputs, out_dir, title=title, log_cb=log)
-    failed = [(i, d) for i, ok, d in results if not ok]
+    results = convert_batch(inputs, out_dir, title=title, log_cb=log,
+                            concurrency=concurrency,
+                            pause_event=pause_event, cancel_event=cancel_event)
+    ok = sum(1 for _, ok_, _ in results if ok_)
+    failed = [(i, d) for i, ok_, d in results if not ok_ and d != "已取消"]
+    cancelled = [(i, d) for i, ok_, d in results if d == "已取消"]
     log("")
+    if cancelled:
+        log("用户取消：成功 %d，失败 %d，取消 %d" % (ok, len(failed), len(cancelled)))
+        return 130
     if failed:
         log("以下 %d 项转换失败：" % len(failed))
         for i, err in failed:
             log("  - %s" % i)
             log("    原因: %s" % err)
         return 2
+    log("全部转换成功：共 %d 项" % ok)
     return 0
 
 
@@ -839,8 +1107,9 @@ def main():
         sys.exit(run_cli(sys.argv[sys.argv.index("--cli") + 1:]))
     if not TK_AVAILABLE:
         log("当前环境无图形界面，请使用命令行模式：")
-        log("python telegraph-epub-converter.py --cli <链接或路径> [--out 目录] [--title 书名]")
+        log("python telegraph-epub-converter.py --cli <链接或路径> [--out 目录] [--title 书名] [--jobs 1-16]")
         log("或批量模式：--cli 输入1 输入2 ... / --cli --dir 文件夹")
+        log("转换中：Ctrl+C 取消，Ctrl+Break 暂停/继续")
         return 1
     root = tk.Tk()
     ConverterApp(root)
