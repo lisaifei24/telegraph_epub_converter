@@ -15,7 +15,7 @@ telegra.ph 漫画网页一键转 EPUB 电子书工具（tkinter GUI + CLI，支�
      - GUI：输入列表支持添加多条（文件多选 / 在线链接 / 扫描文件夹），
             可增删、清空，逐个转换并汇总成功 / 失败 / 取消结果
      - CLI：--cli 后接多个输入参数，或 --dir 扫描文件夹内所有 Telegraph 网页文件
-  6. 并发下载图片：ThreadPoolExecutor 多线程，默认 6 路并发（--jobs / GUI 可调 1-16），
+  6. 并发下载图片：ThreadPoolExecutor 多线程，默认 16 路并发（--jobs / GUI 可调 1-64），
      下载完成后按页面顺序写入 EPUB，图片顺序稳定
   7. 暂停 / 继续：GUI 按钮一键暂停下载与打包、随时继续；CLI 按 Ctrl+Break 切换暂停
   8. 取消：GUI 按钮一键取消当前及后续任务；CLI 按 Ctrl+C 优雅取消。
@@ -25,7 +25,7 @@ telegra.ph 漫画网页一键转 EPUB 电子书工具（tkinter GUI + CLI，支�
   * 双击脚本 → 弹出 GUI，通过"添加文件 / 添加链接 / 添加文件夹"建立输入列表后批量转换；
     转换中可用"暂停/继续"与"取消"按钮控制
   * 命令行（无界面）：
-      单输入  : python telegraph-epub-converter.py --cli <本地路径或在线链接> [--out <输出目录>] [--title <书名>] [--jobs <1-16>]
+      单输入  : python telegraph-epub-converter.py --cli <本地路径或在线链接> [--out <输出目录>] [--title <书名>] [--jobs <1-64>]
       多输入  : python telegraph-epub-converter.py --cli <输入1> <输入2> ... [--out <输出目录>]
       扫文件夹: python telegraph-epub-converter.py --cli --dir <文件夹> [--out <输出目录>]
       组合    : python telegraph-epub-converter.py --cli <输入1> --dir <文件夹> ... [--out <输出目录>]
@@ -68,8 +68,8 @@ UA = {
 }
 TIMEOUT = 60
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
-DEFAULT_CONCURRENCY = 6      # 默认并发下载线程数
-MAX_CONCURRENCY = 16         # 并发数上限
+DEFAULT_CONCURRENCY = 16      # 默认并发下载线程数
+MAX_CONCURRENCY = 64         # 并发数上限
 MIN_CONCURRENCY = 1
 
 
@@ -197,7 +197,7 @@ def download_images_concurrently(img_urls, tmp_dir, concurrency=DEFAULT_CONCURRE
                                  progress_cb=None, pause_event=None, cancel_event=None):
     """并发下载全部图片，返回按页面顺序排列的本地路径列表。
 
-    - 使用 ThreadPoolExecutor 滑动窗口调度，并发数 = concurrency（1-16）
+    - 使用 ThreadPoolExecutor 滑动窗口调度，并发数 = concurrency（1-64）
     - 下载结果按原顺序放入 img_paths，保证 EPUB 页面顺序稳定
     - 暂停：pause_event 未设置时阻塞等待（可被取消中断）
     - 取消：cancel_event 设置时取消未启动任务并抛出 DownloadCancelledError
@@ -994,7 +994,7 @@ if TK_AVAILABLE:
 def run_cli(argv):
     """命令行模式（支持批量 / 并发 / 暂停 / 取消）：
 
-      单输入  : --cli <链接或路径> [--out 目录] [--title 书名] [--jobs 1-16]
+      单输入  : --cli <链接或路径> [--out 目录] [--title 书名] [--jobs 1-64]
       多输入  : --cli <输入1> <输入2> ... [--out 目录]
       扫文件夹: --cli --dir <文件夹> [--out 目录]
       组合    : --cli <输入1> --dir <文件夹> ... [--out 目录]
@@ -1035,7 +1035,7 @@ def run_cli(argv):
 
     if not inputs:
         log("用法:")
-        log("  单输入  : python telegraph-epub-converter.py --cli <链接或路径> [--out 目录] [--title 书名] [--jobs 1-16]")
+        log("  单输入  : python telegraph-epub-converter.py --cli <链接或路径> [--out 目录] [--title 书名] [--jobs 1-64]")
         log("  多输入  : python telegraph-epub-converter.py --cli <输入1> <输入2> ... [--out 目录]")
         log("  扫文件夹: python telegraph-epub-converter.py --cli --dir <文件夹> [--out 目录]")
         log("  组合    : python telegraph-epub-converter.py --cli <输入1> --dir <文件夹> ... [--out 目录]")
@@ -1107,7 +1107,7 @@ def main():
         sys.exit(run_cli(sys.argv[sys.argv.index("--cli") + 1:]))
     if not TK_AVAILABLE:
         log("当前环境无图形界面，请使用命令行模式：")
-        log("python telegraph-epub-converter.py --cli <链接或路径> [--out 目录] [--title 书名] [--jobs 1-16]")
+        log("python telegraph-epub-converter.py --cli <链接或路径> [--out 目录] [--title 书名] [--jobs 1-64]")
         log("或批量模式：--cli 输入1 输入2 ... / --cli --dir 文件夹")
         log("转换中：Ctrl+C 取消，Ctrl+Break 暂停/继续")
         return 1
