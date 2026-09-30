@@ -44,6 +44,15 @@ python --version
 python -c "import tkinter, zipfile, urllib.request"
 ```
 
+### Windows 免安装版（exe）
+
+**v1.0.0 已发布 Release**，提供 Windows 免安装 exe 直接下载：
+
+- 下载地址：[telegraph_epub_converter.exe](https://github.com/lisaifei24/telegraph_epub_converter/releases/download/v1.0.0/telegraph_epub_converter.exe)（约 12.2MB，免安装、无需 Python 环境）
+- SHA-256：`1449ad6857a47843894fd56022f86e0225b9873302e5dd5e1da02eeb145c8bb7`
+- Release 页面：https://github.com/lisaifei24/telegraph_epub_converter/releases/tag/v1.0.0
+- 功能简介：支持 GUI / CLI 双模式、批量转换、图片并发下载、暂停 / 取消等全部功能
+
 ## 使用
 
 ### GUI 模式
