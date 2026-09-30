@@ -32,6 +32,7 @@ telegra.ph 漫画网页一键转 EPUB 电子书工具（tkinter GUI + CLI，支�
 - **取消**：转换中可取消当前及后续任务，取消后自动清理临时文件，已完成的输出保留、未完成的标记为「已取消」
 - 提取漫画原图（保持清晰度），按页面顺序逐页排版，生成 EPUB3（含 NCX 兼容老阅读器）
 - 输出 EPUB 自动结构校验（mimetype / container / opf / 页面 / 图片引用 / zip 完整性）
+- **版本管理**：GUI 标题栏与界面右下角显示当前版本号；启动时自动检查 GitHub 最新 Release，界面提供「检查更新」按钮（仅提示新版下载链接，不自动下载，网络失败静默）
 - **纯标准库实现**（urllib 下载、zipfile 手写 EPUB3），零第三方依赖
 
 ## 安装
@@ -46,12 +47,12 @@ python -c "import tkinter, zipfile, urllib.request"
 
 ### Windows 免安装版（exe）
 
-**v1.1.0 已发布 Release**，提供 Windows 免安装 exe 直接下载：
+**v1.2.0 已发布 Release**，提供 Windows 免安装 exe 直接下载：
 
-- 下载地址：[telegraph_epub_converter.exe](https://github.com/lisaifei24/telegraph_epub_converter/releases/download/v1.1.0/telegraph_epub_converter.exe)（约 12.2MB，免安装、无需 Python 环境）
-- SHA-256：`8965824031792FFBBFAEC7B8035D26852E75706FA00910A35C2BC0E8A338D1EB`
-- Release 页面：https://github.com/lisaifei24/telegraph_epub_converter/releases/tag/v1.1.0
-- 功能简介：支持 GUI / CLI 双模式、批量转换、图片并发下载、暂停 / 取消等全部功能；v1.1.0 新增本地整页保存图片（相对路径 `_files` 目录）解析支持，修复本地 HTML 转换提示"未找到任何漫画图片"的问题
+- 下载地址：[telegraph_epub_converter.exe](https://github.com/lisaifei24/telegraph_epub_converter/releases/download/v1.2.0/telegraph_epub_converter.exe)（约 12.2MB，免安装、无需 Python 环境）
+- SHA-256：`2BAFE7D6ECA5E2A2312B44329C151A69A4DF3083ABCE31DDB05758057C5C5483`
+- Release 页面：https://github.com/lisaifei24/telegraph_epub_converter/releases/tag/v1.2.0
+- 功能简介：支持 GUI / CLI 双模式、批量转换、图片并发下载、暂停 / 取消等全部功能；v1.2.0 新增版本管理：GUI 标题栏与界面显示版本号、CLI `--version` 输出版本、启动 / 手动「检查更新」（通过 GitHub API 查询最新 Release，仅提示不自动下载）、exe 内置 Windows 文件属性版本信息
 
 ## 使用
 
@@ -86,6 +87,9 @@ python telegraph_epub_converter.py --cli --dir <文件夹> [--out <输出目录>
 
 # 组合：位置参数 + 多个 --dir 可同时使用
 python telegraph_epub_converter.py --cli 输入1 --dir 文件夹A --dir 文件夹B [--out <输出目录>]
+
+# 查看版本号
+python telegraph_epub_converter.py --version
 ```
 
 > 转换过程中：**Ctrl+C** 优雅取消（清理临时文件、标记未完成任务为「已取消」）；**Ctrl+Break** 暂停 / 继续（Windows；类 Unix 下为 Ctrl+Z）。
@@ -144,6 +148,10 @@ python telegraph_epub_converter.py --cli "https://telegra.ph/xxx" --title "我�
 
 **Q7：本地整页保存的 Telegraph HTML 转换时提示"未找到任何漫画图片"？**
 这是旧版（v1.0.0 及之前）的已知问题：整页保存的网页图片存放在同名 `_files` 目录中，`<img>` 使用的是 `./xxx_files/0001.webp` 这类本地相对路径，旧版只匹配 `http(s)` 外链导致全部漏掉。v1.1.0 已支持相对路径图片解析（含 `.webp` / `.avif` 等扩展名），升级即可修复。
+
+**Q8：如何查看当前版本、如何知道有新版本？**
+- 查看版本：GUI 标题栏与界面右下角显示版本号（如 `v1.2.0`）；CLI 运行 `python telegraph_epub_converter.py --version` 输出版本。
+- 检查更新：程序启动时自动查询 GitHub 最新 Release（静默检查，不阻塞启动）；也可随时点击界面「检查更新」按钮手动检查。若远程存在更高版本，会提示新版下载链接（仅提示，不自动下载）；网络不可用时静默忽略，不影响正常使用。
 *（内容由AI生成，仅供参考）*
 *（内容由AI生成，仅供参考）*
 *（内容由AI生成，仅供参考）*

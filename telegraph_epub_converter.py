@@ -20,6 +20,11 @@ telegra.ph 漫画网页一键转 EPUB 电子书工具（tkinter GUI + CLI，支�
   7. 暂停 / 继续：GUI 按钮一键暂停下载与打包、随时继续；CLI 按 Ctrl+Break 切换暂停
   8. 取消：GUI 按钮一键取消当前及后续任务；CLI 按 Ctrl+C 优雅取消。
      取消后自动清理临时文件：已完成的转换保留输出，未完成的标记为"已取消"
+  9. 版本管理：
+     - GUI 窗口标题显示当前版本号，并提供「检查更新」按钮（启动时也会静默检查一次）
+     - CLI 支持 `--version` 输出版本号
+     - 通过 GitHub API 查询最新 Release，若远程版本高于本地则弹窗提示下载链接
+       （仅提示，不自动下载；网络失败时静默忽略，不影响使用）
 
 用法：
   * 双击脚本 → 弹出 GUI，通过"添加文件 / 添加链接 / 添加文件夹"建立输入列表后批量转换；
@@ -29,6 +34,7 @@ telegra.ph 漫画网页一键转 EPUB 电子书工具（tkinter GUI + CLI，支�
       多输入  : python telegraph-epub-converter.py --cli <输入1> <输入2> ... [--out <输出目录>]
       扫文件夹: python telegraph-epub-converter.py --cli --dir <文件夹> [--out <输出目录>]
       组合    : python telegraph-epub-converter.py --cli <输入1> --dir <文件夹> ... [--out <输出目录>]
+      查版本  : python telegraph-epub-converter.py --version
     转换中：Ctrl+C 取消，Ctrl+Break 暂停/继续（Windows）
 """
 
@@ -36,6 +42,7 @@ import os
 import re
 import sys
 import time
+import json
 import socket
 import html as html_mod
 import urllib.request
@@ -67,7 +74,10 @@ UA = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 TIMEOUT = 60
-VERSION = "1.1.0"   # 当前版本号（v1.1.0：支持本地整页保存图片相对路径解析）
+VERSION = "1.2.0"   # 当前版本号（v1.2.0：新增版本管理——GUI/CLI 显示版本、GitHub 更新检查、exe Windows 版本资源）
+GITHUB_REPO = "lisaifei24/telegraph_epub_converter"      # 用于更新检查的 GitHub 仓库
+RELEASE_BASE_URL = "https://github.com/%s/releases/download" % GITHUB_REPO
+CHECK_UPDATE_TIMEOUT = 8                                 # 更新检查网络超时（秒），失败静默
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
 DEFAULT_CONCURRENCY = 16      # 默认并发下载线程数
 MAX_CONCURRENCY = 64         # 并发数上限
@@ -96,6 +106,37 @@ def check_control(pause_event, cancel_event):
 
 
 # ---------------------------------------------------------------- 网络 / 解析
+
+def _parse_version(v):
+    """从 'v1.2.0' / '1.2.0' 解析出 (major, minor, patch) 元组；解析失败返回 None。"""
+    s = str(v or "").strip().lstrip("vV")
+    m = re.match(r"^(\d+)\.(\d+)(?:\.(\d+))?", s)
+    if not m:
+        return None
+    return tuple(int(x or 0) for x in m.groups())
+
+
+def check_latest_release(timeout=CHECK_UPDATE_TIMEOUT):
+    """查询 GitHub 最新 Release（8 秒超时）。
+
+    返回 (latest_tag, download_url)：latest_tag 形如 'v1.2.0'，download_url 为对应
+    exe 下载链接；网络失败 / 无 Release / 解析异常时返回 None（调用方静默忽略）。
+    仅查询与提示，不自动下载。
+    """
+    try:
+        req = urllib.request.Request(
+            "https://api.github.com/repos/%s/releases/latest" % GITHUB_REPO,
+            headers={"User-Agent": UA["User-Agent"], "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        tag = (data or {}).get("tag_name", "") if isinstance(data, dict) else ""
+        if not tag:
+            return None
+        url = "%s/%s/telegraph_epub_converter.exe" % (RELEASE_BASE_URL, tag)
+        return tag, url
+    except Exception:
+        return None
+
 
 def log(msg):
     """CLI 模式日志输出"""
@@ -711,7 +752,7 @@ if TK_AVAILABLE:
             self.pause_event.set()
             self.cancel_event = threading.Event()
 
-            root.title("telegra.ph 漫画 → EPUB 转换器（批量 / 并发）")
+            root.title("telegra.ph 漫画 → EPUB 转换器（批量 / 并发） v%s" % VERSION)
             root.geometry("720x660")
             root.minsize(640, 560)
 
@@ -768,13 +809,16 @@ if TK_AVAILABLE:
             self.cancel_btn = ttk.Button(ctrl_frame, text="取消", command=self.on_cancel,
                                          state="disabled")
             self.cancel_btn.pack(side="left", padx=4)
+            ttk.Button(ctrl_frame, text="检查更新", command=self.check_update_manual).pack(side="left", padx=4)
 
             # 进度
             self.progress = ttk.Progressbar(frm, mode="determinate", maximum=100)
             self.progress.grid(row=8, column=0, columnspan=4, sticky="ew", padx=10, pady=5)
             self.status_var = tk.StringVar(value="就绪")
             ttk.Label(frm, textvariable=self.status_var, anchor="w").grid(
-                row=9, column=0, columnspan=4, sticky="ew", padx=10, pady=5)
+                row=9, column=0, columnspan=3, sticky="ew", padx=(10, 5), pady=5)
+            ttk.Label(frm, text="v%s" % VERSION, foreground="#888888").grid(
+                row=9, column=3, sticky="e", padx=(0, 10), pady=5)
 
             # 日志
             ttk.Label(frm, text="运行日志:").grid(row=10, column=0, columnspan=4, sticky="w", **pad)
@@ -789,6 +833,23 @@ if TK_AVAILABLE:
 
             self.root.protocol("WM_DELETE_WINDOW", self.on_close)
             self.root.after(100, self.poll_queue)
+            self.root.after(1500, self._auto_check_update)
+
+        # ---- 版本与更新检查
+        def _check_update_worker(self, manual):
+            result = check_latest_release()
+            self.queue.put(("update_result", (manual, result)))
+
+        def check_update_manual(self):
+            if self.worker and self.worker.is_alive():
+                messagebox.showinfo("提示", "正在转换中，请稍后再检查更新")
+                return
+            self.append_log("[更新] 正在检查 GitHub 最新版本...")
+            threading.Thread(target=self._check_update_worker, args=(True,), daemon=True).start()
+
+        def _auto_check_update(self):
+            """启动后静默检查一次：仅在有新版本时提示，网络失败无任何打扰"""
+            threading.Thread(target=self._check_update_worker, args=(False,), daemon=True).start()
 
         # ---- 输入列表操作
         def browse_input(self):
@@ -1021,6 +1082,7 @@ def run_cli(argv):
       多输入  : --cli <输入1> <输入2> ... [--out 目录]
       扫文件夹: --cli --dir <文件夹> [--out 目录]
       组合    : --cli <输入1> --dir <文件夹> ... [--out 目录]
+      查版本  : --version
 
     转换中控制信号（Windows）：
       Ctrl+C    → 优雅取消（清理临时文件，已完成保留、未完成标记取消）
@@ -1062,6 +1124,7 @@ def run_cli(argv):
         log("  多输入  : python telegraph-epub-converter.py --cli <输入1> <输入2> ... [--out 目录]")
         log("  扫文件夹: python telegraph-epub-converter.py --cli --dir <文件夹> [--out 目录]")
         log("  组合    : python telegraph-epub-converter.py --cli <输入1> --dir <文件夹> ... [--out 目录]")
+        log("  查版本  : python telegraph-epub-converter.py --version")
         log("转换中：Ctrl+C 取消，Ctrl+Break 暂停/继续")
         return 1
 
@@ -1126,6 +1189,13 @@ def run_cli(argv):
 
 
 def main():
+    if "--version" in sys.argv:
+        try:
+            sys.stdout.write("telegraph_epub_converter v%s\n" % VERSION)
+            sys.stdout.flush()
+        except Exception:
+            pass
+        return 0
     if "--cli" in sys.argv:
         sys.exit(run_cli(sys.argv[sys.argv.index("--cli") + 1:]))
     if not TK_AVAILABLE:
