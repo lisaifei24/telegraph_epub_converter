@@ -25,6 +25,12 @@ telegra.ph 漫画网页一键转 EPUB 电子书工具（tkinter GUI + CLI，支�
      - CLI 支持 `--version` 输出版本号
      - 通过 GitHub API 查询最新 Release，若远程版本高于本地则弹窗提示下载链接
        （仅提示，不自动下载；网络失败时静默忽略，不影响使用）
+  10. EPUB 元数据编辑：支持设置标题 / 作者 / 语言 / 标签 / 描述并写入 OPF 元数据
+      （GUI 输入框，CLI 用 --author / --language / --tags / --description）
+  11. 章节分组：支持按卷 / 话分组生成嵌套目录（EPUB3 nav 多级 + NCX 兼容）；
+      GUI 输入如「第1卷:1-20,第2卷:21-40」，CLI 用 --chapters 参数
+  12. 封面自定义：GUI 可选择本地图片作为封面，CLI 用 --cover 参数；未选择时保持自动封面
+  13. CSS 排版注入：可定制页面背景 / 图片边距等样式（GUI 预设 + 自定义文本，CLI 用 --css / --css-file）
 
 用法：
   * 双击脚本 → 弹出 GUI，通过"添加文件 / 添加链接 / 添加文件夹"建立输入列表后批量转换；
@@ -35,6 +41,12 @@ telegra.ph 漫画网页一键转 EPUB 电子书工具（tkinter GUI + CLI，支�
       扫文件夹: python telegraph-epub-converter.py --cli --dir <文件夹> [--out <输出目录>]
       组合    : python telegraph-epub-converter.py --cli <输入1> --dir <文件夹> ... [--out <输出目录>]
       查版本  : python telegraph-epub-converter.py --version
+    可选参数：
+      --author <作者>   --language <语言，默认 zh>   --tags <标签A,标签B>
+      --description <描述>
+      --chapters <分组>，如 "第1卷:1-20,第2卷:21-40"（生成多级目录）
+      --cover <本地图片路径>（自定义封面；缺省用首页图片自动生成封面）
+      --css <CSS文本> 或 --css-file <CSS文件路径>（自定义页面排版样式）
     转换中：Ctrl+C 取消，Ctrl+Break 暂停/继续（Windows）
 """
 
@@ -74,7 +86,7 @@ UA = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 TIMEOUT = 60
-VERSION = "1.2.0"   # 当前版本号（v1.2.0：新增版本管理——GUI/CLI 显示版本、GitHub 更新检查、exe Windows 版本资源）
+VERSION = "1.3.0"   # 当前版本号（v1.3.0：新增 EPUB 元数据编辑、章节分组、封面自定义、CSS 排版注入）
 GITHUB_REPO = "lisaifei24/telegraph_epub_converter"      # 用于更新检查的 GitHub 仓库
 RELEASE_BASE_URL = "https://github.com/%s/releases/download" % GITHUB_REPO
 CHECK_UPDATE_TIMEOUT = 8                                 # 更新检查网络超时（秒），失败静默
@@ -82,6 +94,19 @@ IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
 DEFAULT_CONCURRENCY = 16      # 默认并发下载线程数
 MAX_CONCURRENCY = 64         # 并发数上限
 MIN_CONCURRENCY = 1
+
+# ---- v1.3.0 CSS 排版注入 ----
+DEFAULT_CSS = (
+    "body{margin:0;padding:0;text-align:center;background:#000;}\n"
+    "img{width:100%;max-width:100%;height:auto;display:block;margin:0 auto;}"
+)
+CSS_PRESETS = {
+    "深色（默认）": DEFAULT_CSS,
+    "浅色": "body{margin:0;padding:0;text-align:center;background:#fff;}\n"
+            "img{width:100%;max-width:100%;height:auto;display:block;margin:0 auto;}",
+    "浅色留白": "body{margin:0;padding:12px;text-align:center;background:#fff;}\n"
+              "img{width:100%;max-width:100%;height:auto;display:block;margin:0 auto;}",
+}
 
 
 class DownloadCancelledError(Exception):
@@ -350,26 +375,96 @@ def html_escape(s):
     return html_mod.escape(str(s), quote=True)
 
 
-def build_page_xhtml(title, page_no, img_src):
+def build_page_xhtml(title, page_no, img_src, css=None):
+    """生成单页 XHTML，可注入自定义 CSS（v1.3.0）"""
+    style = css if css is not None else DEFAULT_CSS
     return (
         '<?xml version="1.0" encoding="utf-8"?>\n'
         '<!DOCTYPE html>\n'
         '<html xmlns="http://www.w3.org/1999/xhtml">\n'
         '<head><title>第 %d 页</title>\n'
-        '<style>body{margin:0;padding:0;text-align:center;background:#000;}\n'
-        'img{width:100%%;max-width:100%%;height:auto;display:block;margin:0 auto;}</style>\n'
+        '<style>%s</style>\n'
         '</head>\n'
         '<body><div><img src="%s" alt="page %d"/></div></body>\n'
-        '</html>\n' % (page_no, img_src, page_no)
+        '</html>\n' % (page_no, style, img_src, page_no)
     )
 
 
-def build_ncx(title, epub_id, page_count):
-    nav_points = "".join(
-        '<navPoint id="p%d" playOrder="%d"><navLabel><text>第 %d 页</text></navLabel>'
-        '<content src="page_%03d.xhtml"/></navPoint>' % (i, i, i, i)
-        for i in range(1, page_count + 1)
-    )
+def parse_chapters(spec, page_count):
+    """解析章节分组描述（v1.3.0）。
+
+    格式：分组名:页码范围 以 , 或 ; 分隔，如 "第1卷:1-20,第2卷:21-40"
+    页码范围支持 "1-20"、"21"（单页）。返回 [(label, start, end), ...]；
+    未提供分组返回 None；格式非法或范围越界抛出 ValueError（信息含原因）。
+    """
+    if spec is None:
+        return None
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+    groups = []
+    for part in re.split(r"[,;，；]", spec):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.match(r"^(.+?)\s*[:：]\s*(\d+)(?:\s*-\s*(\d+))?$", part)
+        if not m:
+            raise ValueError("章节分组格式错误：%r（应为 分组名:页码范围，如 第1卷:1-20）" % part)
+        label = m.group(1).strip()
+        start = int(m.group(2))
+        end = int(m.group(3)) if m.group(3) else start
+        if start < 1 or end < start or end > page_count:
+            raise ValueError(
+                "章节分组越界：%r（页码范围 %d-%d，本书共 %d 页）" % (label, start, end, page_count))
+        groups.append((label, start, end))
+    if not groups:
+        raise ValueError("章节分组描述为空，请检查 --chapters 参数")
+    return groups
+
+
+def build_nav_entries(title, page_count, chapters=None):
+    """构建 EPUB3 nav.xhtml 的 <ol> 目录条目；chapters 非空时生成多级嵌套"""
+    if not chapters:
+        return "".join(
+            '<li><a href="page_%03d.xhtml">第 %d 页</a></li>' % (i, i)
+            for i in range(1, page_count + 1)
+        )
+    parts = []
+    for label, start, end in chapters:
+        pages = "".join(
+            '<li><a href="page_%03d.xhtml">第 %d 页</a></li>' % (i, i)
+            for i in range(start, end + 1)
+        )
+        parts.append('<li><span>%s</span>\n<ol>\n%s\n</ol>\n</li>'
+                     % (html_escape(label), pages))
+    return "\n".join(parts)
+
+
+def build_ncx(title, epub_id, page_count, chapters=None):
+    """生成 EPUB2 兼容 toc.ncx；chapters 非空时生成嵌套 navPoint"""
+    if not chapters:
+        nav_points = "".join(
+            '<navPoint id="p%d" playOrder="%d"><navLabel><text>第 %d 页</text></navLabel>'
+            '<content src="page_%03d.xhtml"/></navPoint>' % (i, i, i, i)
+            for i in range(1, page_count + 1)
+        )
+    else:
+        order = 0
+        nav_points = []
+        for gidx, (label, start, end) in enumerate(chapters, 1):
+            order += 1
+            group_id = "g%d" % gidx
+            children = []
+            for i in range(start, end + 1):
+                order += 1
+                children.append(
+                    '<navPoint id="p%d" playOrder="%d"><navLabel><text>第 %d 页</text></navLabel>'
+                    '<content src="page_%03d.xhtml"/></navPoint>' % (i, order, i, i))
+            nav_points.append(
+                '<navPoint id="%s" playOrder="%d"><navLabel><text>%s</text></navLabel>\n'
+                '%s\n</navPoint>' % (group_id, order - (end - start + 1), html_escape(label),
+                                     "\n".join(children)))
+        nav_points = "\n".join(nav_points)
     return (
         '<?xml version="1.0" encoding="utf-8"?>\n'
         '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">\n'
@@ -380,12 +475,22 @@ def build_ncx(title, epub_id, page_count):
     )
 
 
-def build_epub(images, title, out_path, progress_cb=None, pause_event=None, cancel_event=None):
+def build_epub(images, title, out_path, progress_cb=None, pause_event=None, cancel_event=None,
+               author=None, language=None, tags=None, description=None,
+               chapters=None, cover_path=None, css=None):
     """手写 EPUB3（含 NCX 兼容老阅读器），逐页排版漫画图片。
 
     images: 本地图片绝对路径列表（已按页面顺序）
     title : 书名
     out_path: 输出 .epub 路径
+    v1.3.0 新增：
+      author      - 作者（写入 OPF dc:creator）
+      language    - 语言（默认 zh，写入 OPF dc:language）
+      tags        - 标签列表（每个写入 OPF dc:subject）
+      description - 描述（写入 OPF dc:description）
+      chapters    - 章节分组 [(label, start, end), ...]，生成多级目录
+      cover_path  - 自定义封面本地图片路径；缺省用首页图片自动生成封面
+      css         - 自定义页面排版 CSS（控制页面背景 / 图片边距等），缺省深色
     """
     def report(pct, msg):
         if progress_cb:
@@ -405,7 +510,20 @@ def build_epub(images, title, out_path, progress_cb=None, pause_event=None, canc
         if ext == ".jpeg":
             ext = ".jpg"
         ext_by_path.append(ext)
-    cover_ext = ext_by_path[0]
+    if cover_path:
+        cover_ext = os.path.splitext(cover_path)[1].lower() or ".jpg"
+        if cover_ext not in IMG_EXTS:
+            cover_ext = ".jpg"
+        if cover_ext == ".jpeg":
+            cover_ext = ".jpg"
+        cover_arcname = "images/cover%s" % cover_ext
+        cover_img_name = "cover%s" % cover_ext
+    else:
+        cover_ext = ext_by_path[0]
+        cover_arcname = "images/cover%s" % cover_ext
+        cover_img_name = "cover%s" % cover_ext
+    style = css if css is not None else DEFAULT_CSS
+    lang = (language or "zh").strip() or "zh"
 
     epub_id = "urn:uuid:" + datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
     date_str = datetime.date.today().isoformat()
@@ -429,30 +547,26 @@ def build_epub(images, title, out_path, progress_cb=None, pause_event=None, canc
     # 3) 每页 XHTML
     for i, ext in enumerate(ext_by_path, 1):
         check_control(pause_event, cancel_event)
-        xhtml = build_page_xhtml(title, i, "images/page_%03d%s" % (i, ext))
+        xhtml = build_page_xhtml(title, i, "images/page_%03d%s" % (i, ext), css=style)
         file_specs.append(("EPUB/page_%03d.xhtml" % i, xhtml.encode("utf-8"), zipfile.ZIP_DEFLATED))
 
-    # 4) 封面 XHTML（第一页图片）
+    # 4) 封面 XHTML（默认首页图片；v1.3.0 支持自定义封面）
     check_control(pause_event, cancel_event)
     cover_xhtml = (
         '<?xml version="1.0" encoding="utf-8"?>\n'
         '<!DOCTYPE html>\n'
         '<html xmlns="http://www.w3.org/1999/xhtml">\n'
         '<head><title>封面</title>\n'
-        '<style>body{margin:0;padding:0;text-align:center;background:#000;}\n'
-        'img{width:100%%;max-width:100%%;height:auto;display:block;margin:0 auto;}</style>\n'
+        '<style>%s</style>\n'
         '</head>\n'
-        '<body><div><img src="images/cover%s" alt="cover"/></div></body>\n'
-        '</html>\n' % cover_ext
+        '<body><div><img src="%s" alt="cover"/></div></body>\n'
+        '</html>\n' % (style, cover_arcname)
     )
     file_specs.append(("EPUB/cover.xhtml", cover_xhtml.encode("utf-8"), zipfile.ZIP_DEFLATED))
 
-    # 5) nav.xhtml（EPUB3 目录导航）
+    # 5) nav.xhtml（EPUB3 目录导航；v1.3.0 支持多级嵌套）
     check_control(pause_event, cancel_event)
-    nav_entries = "".join(
-        '<li><a href="page_%03d.xhtml">第 %d 页</a></li>' % (i, i)
-        for i in range(1, page_count + 1)
-    )
+    nav_entries = build_nav_entries(title, page_count, chapters)
     nav_xhtml = (
         '<?xml version="1.0" encoding="utf-8"?>\n'
         '<!DOCTYPE html>\n'
@@ -468,12 +582,13 @@ def build_epub(images, title, out_path, progress_cb=None, pause_event=None, canc
     )
     file_specs.append(("EPUB/nav.xhtml", nav_xhtml.encode("utf-8"), zipfile.ZIP_DEFLATED))
 
-    # 6) toc.ncx（EPUB2 兼容）
+    # 6) toc.ncx（EPUB2 兼容；v1.3.0 支持嵌套 navPoint）
     check_control(pause_event, cancel_event)
-    file_specs.append(("EPUB/toc.ncx", build_ncx(title, epub_id, page_count).encode("utf-8"),
+    file_specs.append(("EPUB/toc.ncx",
+                       build_ncx(title, epub_id, page_count, chapters).encode("utf-8"),
                        zipfile.ZIP_DEFLATED))
 
-    # 7) content.opf（清单 + 书脊）
+    # 7) content.opf（清单 + 书脊；v1.3.0 支持自定义元数据）
     check_control(pause_event, cancel_event)
     manifest_items = []
     manifest_items.append('<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>')
@@ -482,8 +597,9 @@ def build_epub(images, title, out_path, progress_cb=None, pause_event=None, canc
     for i in range(1, page_count + 1):
         manifest_items.append('<item id="page_%03d" href="page_%03d.xhtml" media-type="application/xhtml+xml"/>'
                               % (i, i))
-    manifest_items.append('<item id="cover_img" href="images/cover%s" media-type="%s"/>'
-                          % (cover_ext, media_type(cover_ext)))
+    cover_img_props = ' properties="cover-image"' if cover_path else ""
+    manifest_items.append('<item id="cover_img" href="images/cover%s" media-type="%s"%s/>'
+                          % (cover_ext, media_type(cover_ext), cover_img_props))
     for i, ext in enumerate(ext_by_path, 1):
         manifest_items.append('<item id="img_%03d" href="images/page_%03d%s" media-type="%s"/>'
                               % (i, i, ext, media_type(ext)))
@@ -491,21 +607,36 @@ def build_epub(images, title, out_path, progress_cb=None, pause_event=None, canc
     spine_items = ['<itemref idref="cover"/>'] + \
                   ['<itemref idref="page_%03d"/>' % i for i in range(1, page_count + 1)]
 
+    meta_extra = []
+    if author:
+        meta_extra.append('    <dc:creator>%s</dc:creator>' % html_escape(author))
+    for tag in (tags or []):
+        tag = (tag or "").strip()
+        if tag:
+            meta_extra.append('    <dc:subject>%s</dc:subject>' % html_escape(tag))
+    if description:
+        meta_extra.append('    <dc:description>%s</dc:description>' % html_escape(description))
+    meta_block = "\n".join(meta_extra)
+
     opf = (
         '<?xml version="1.0" encoding="utf-8"?>\n'
-        '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="pub-id" xml:lang="zh">\n'
+        '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="pub-id" xml:lang="%s">\n'
         '  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">\n'
         '    <dc:identifier id="pub-id">%s</dc:identifier>\n'
         '    <dc:title>%s</dc:title>\n'
-        '    <dc:language>zh</dc:language>\n'
+        '    <dc:language>%s</dc:language>\n'
         '    <dc:date>%s</dc:date>\n'
+        '%s\n'
         '    <meta property="dcterms:modified">%sT00:00:00Z</meta>\n'
         '  </metadata>\n'
         '  <manifest>\n%s\n  </manifest>\n'
         '  <spine toc="ncx">\n%s\n  </spine>\n'
         '  <guide>\n    <reference type="cover" title="封面" href="cover.xhtml"/>\n  </guide>\n'
         '</package>\n' % (
-            html_escape(epub_id), html_escape(title), date_str, date_str,
+            html_escape(lang), html_escape(epub_id), html_escape(title), html_escape(lang),
+            date_str,
+            meta_block if meta_block else "",
+            date_str,
             "\n".join("    " + m for m in manifest_items),
             "\n".join("    " + s for s in spine_items),
         )
@@ -519,8 +650,12 @@ def build_epub(images, title, out_path, progress_cb=None, pause_event=None, canc
         with open(img_path, "rb") as f:
             file_specs.append(("EPUB/images/page_%03d%s" % (i, ext), f.read(), zipfile.ZIP_DEFLATED))
     check_control(pause_event, cancel_event)
-    with open(images[0], "rb") as f:
-        file_specs.append(("EPUB/images/cover%s" % cover_ext, f.read(), zipfile.ZIP_DEFLATED))
+    if cover_path:
+        with open(cover_path, "rb") as f:
+            file_specs.append(("EPUB/" + cover_arcname, f.read(), zipfile.ZIP_DEFLATED))
+    else:
+        with open(images[0], "rb") as f:
+            file_specs.append(("EPUB/images/cover%s" % cover_ext, f.read(), zipfile.ZIP_DEFLATED))
 
     # 9) 压缩写出
     report(60, "压缩写入 EPUB ...")
@@ -575,13 +710,26 @@ def validate_epub(epub_path, page_count, ext_by_path):
 # ---------------------------------------------------------------- 主转换流程
 
 def convert(input_raw, out_dir, title=None, progress_cb=None, log_cb=None,
-            concurrency=DEFAULT_CONCURRENCY, pause_event=None, cancel_event=None):
+            concurrency=DEFAULT_CONCURRENCY, pause_event=None, cancel_event=None,
+            author=None, language=None, tags=None, description=None,
+            chapters=None, cover=None, css=None):
     """一键转换入口：解析输入 -> 取页面 -> 提取图片 -> 并发下载 -> 生成 EPUB -> 校验。
 
+    v1.3.0 新增参数：author / language / tags（字符串"a,b"或列表）/ description /
+    chapters（"第1卷:1-20,..."）/ cover（本地图片路径）/ css（自定义 CSS 文本）。
     取消（DownloadCancelledError）时自动清理临时目录；其余异常同样清理后抛出。
     """
     out_dir = os.path.abspath(os.path.expanduser(out_dir))
     os.makedirs(out_dir, exist_ok=True)
+
+    # 预处理 v1.3.0 选项
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",") if t.strip()]
+    if cover and not os.path.isfile(cover):
+        raise ValueError("自定义封面文件不存在：%s" % cover)
+    if css is not None:
+        css = css.strip() or None
+    style = css if css is not None else DEFAULT_CSS
 
     def emit(pct, msg):
         if progress_cb:
@@ -623,7 +771,7 @@ def convert(input_raw, out_dir, title=None, progress_cb=None, log_cb=None,
             progress_cb=lambda pct, m: emit(pct, m),
             pause_event=pause_event, cancel_event=cancel_event)
 
-        # 4) 生成 EPUB
+        # 4) 生成 EPUB（v1.3.0：元数据 / 章节分组 / 自定义封面 / CSS 注入）
         out_name = sanitize_filename(title) + ".epub"
         out_path = os.path.join(out_dir, out_name)
         if os.path.exists(out_path):  # 避免覆盖
@@ -632,9 +780,23 @@ def convert(input_raw, out_dir, title=None, progress_cb=None, log_cb=None,
                 n += 1
             out_path = os.path.join(out_dir, "%s_%d.epub" % (sanitize_filename(title), n))
 
+        groups = parse_chapters(chapters, len(img_paths))
+        if groups:
+            emit(64, "章节分组：%d 组（多级目录）" % len(groups))
+        if author:
+            emit(64, "作者：%s" % author)
+        if tags:
+            emit(64, "标签：%s" % ", ".join(tags))
+        if description:
+            emit(64, "描述：%s" % description[:40] + ("..." if len(description) > 40 else ""))
+        if cover:
+            emit(64, "自定义封面：%s" % cover)
+
         emit(65, "生成 EPUB：%s" % os.path.basename(out_path))
         build_epub(img_paths, title, out_path, progress_cb=emit,
-                   pause_event=pause_event, cancel_event=cancel_event)
+                   pause_event=pause_event, cancel_event=cancel_event,
+                   author=author, language=language, tags=tags, description=description,
+                   chapters=groups, cover_path=cover, css=style)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
     return out_path
@@ -675,11 +837,15 @@ def scan_dir_for_html(dir_path):
 
 
 def convert_batch(inputs, out_dir, title=None, progress_cb=None, log_cb=None,
-                  concurrency=DEFAULT_CONCURRENCY, pause_event=None, cancel_event=None):
+                  concurrency=DEFAULT_CONCURRENCY, pause_event=None, cancel_event=None,
+                  author=None, language=None, tags=None, description=None,
+                  chapters=None, cover=None, css=None):
     """批量转换入口：逐个转换并汇总结果。
 
     inputs: 输入列表（本地路径 / 在线链接均可）
     title : 仅在单输入时生效；批量时自动取各文件标题
+    v1.3.0 新增 author / language / tags / description / chapters / cover / css，
+    与 convert() 同名参数含义一致，透传给每个转换项。
     返回 [(input, ok, detail)]，detail 为输出路径（成功）、错误信息（失败）或"已取消"。
     暂停 / 取消对后续任务同样生效：取消时未开始项直接标记"已取消"。
     """
@@ -721,7 +887,10 @@ def convert_batch(inputs, out_dir, title=None, progress_cb=None, log_cb=None,
                                title=title if total == 1 else None,
                                progress_cb=make_progress(), log_cb=line,
                                concurrency=concurrency,
-                               pause_event=pause_event, cancel_event=cancel_event)
+                               pause_event=pause_event, cancel_event=cancel_event,
+                               author=author, language=language, tags=tags,
+                               description=description, chapters=chapters,
+                               cover=cover, css=css)
             results.append((inp, True, out_path))
             line("[%d/%d] 成功：%s" % (idx, total, out_path))
         except DownloadCancelledError:
@@ -753,8 +922,8 @@ if TK_AVAILABLE:
             self.cancel_event = threading.Event()
 
             root.title("telegra.ph 漫画 → EPUB 转换器（批量 / 并发） v%s" % VERSION)
-            root.geometry("720x660")
-            root.minsize(640, 560)
+            root.geometry("760x880")
+            root.minsize(680, 700)
 
             pad = {"padx": 10, "pady": 5}
             frm = ttk.Frame(root, padding=10)
@@ -794,9 +963,61 @@ if TK_AVAILABLE:
             ttk.Entry(frm, textvariable=self.title_var).grid(
                 row=6, column=0, columnspan=4, sticky="ew", padx=10, pady=5)
 
+            # ④ EPUB 选项（v1.3.0：元数据 / 章节分组 / 封面 / CSS）
+            ttk.Label(frm, text="④ EPUB 选项（可选，均可不填）:").grid(
+                row=7, column=0, columnspan=4, sticky="w", **pad)
+
+            ttk.Label(frm, text="作者:").grid(row=8, column=0, sticky="e", padx=(10, 2), pady=3)
+            self.author_var = tk.StringVar()
+            ttk.Entry(frm, textvariable=self.author_var).grid(
+                row=8, column=1, sticky="ew", padx=(2, 10), pady=3)
+            ttk.Label(frm, text="语言:").grid(row=8, column=2, sticky="e", padx=(10, 2), pady=3)
+            self.language_var = tk.StringVar(value="zh")
+            ttk.Entry(frm, textvariable=self.language_var, width=10).grid(
+                row=8, column=3, sticky="w", padx=(2, 10), pady=3)
+
+            ttk.Label(frm, text="标签:").grid(row=9, column=0, sticky="e", padx=(10, 2), pady=3)
+            self.tags_var = tk.StringVar()
+            ttk.Entry(frm, textvariable=self.tags_var).grid(
+                row=9, column=1, columnspan=3, sticky="ew", padx=(2, 10), pady=3)
+
+            ttk.Label(frm, text="描述:").grid(row=10, column=0, sticky="e", padx=(10, 2), pady=3)
+            self.desc_var = tk.StringVar()
+            ttk.Entry(frm, textvariable=self.desc_var).grid(
+                row=10, column=1, columnspan=3, sticky="ew", padx=(2, 10), pady=3)
+
+            ttk.Label(frm, text="章节分组:").grid(row=11, column=0, sticky="e", padx=(10, 2), pady=3)
+            self.chapters_var = tk.StringVar()
+            ttk.Entry(frm, textvariable=self.chapters_var).grid(
+                row=11, column=1, columnspan=3, sticky="ew", padx=(2, 10), pady=3)
+            ttk.Label(frm, text="按卷/话分组生成多级目录，如：第1卷:1-20,第2卷:21-40",
+                      foreground="#666666").grid(row=12, column=1, columnspan=3, sticky="w",
+                                                 padx=(2, 10), pady=(0, 3))
+
+            ttk.Label(frm, text="封面:").grid(row=13, column=0, sticky="e", padx=(10, 2), pady=3)
+            self.cover_var = tk.StringVar()
+            ttk.Button(frm, text="选择封面图片...", command=self.browse_cover).grid(
+                row=13, column=1, sticky="w", padx=(2, 5), pady=3)
+            ttk.Label(frm, textvariable=self.cover_var, foreground="#666666").grid(
+                row=13, column=2, columnspan=2, sticky="w", padx=(2, 10), pady=3)
+
+            ttk.Label(frm, text="CSS样式:").grid(row=14, column=0, sticky="e", padx=(10, 2), pady=3)
+            self.css_preset_var = tk.StringVar(value="深色（默认）")
+            self.css_preset = ttk.Combobox(
+                frm, textvariable=self.css_preset_var, state="readonly", width=14,
+                values=list(CSS_PRESETS.keys()) + ["自定义"])
+            self.css_preset.grid(row=14, column=1, sticky="w", padx=(2, 10), pady=3)
+            self.css_preset.bind("<<ComboboxSelected>>", self.on_css_preset)
+            self.css_text = tk.Text(frm, height=3, wrap="word")
+            self.css_text.grid(row=15, column=1, columnspan=3, sticky="ew", padx=(2, 10), pady=3)
+            self.css_text.insert("1.0", DEFAULT_CSS)
+            ttk.Label(frm, text="预设即填充到右侧文本框，可继续修改（控制页面背景/图片边距等）",
+                      foreground="#666666").grid(row=16, column=1, columnspan=3, sticky="w",
+                                                 padx=(2, 10), pady=(0, 3))
+
             # 转换按钮 + 并发数 + 暂停/取消
             ctrl_frame = ttk.Frame(frm)
-            ctrl_frame.grid(row=7, column=0, columnspan=4, pady=8)
+            ctrl_frame.grid(row=17, column=0, columnspan=4, pady=8)
             self.convert_btn = ttk.Button(ctrl_frame, text="开始批量转换", command=self.start_convert)
             self.convert_btn.pack(side="left", padx=4)
             ttk.Label(ctrl_frame, text="并发:").pack(side="left", padx=(14, 2))
@@ -813,22 +1034,22 @@ if TK_AVAILABLE:
 
             # 进度
             self.progress = ttk.Progressbar(frm, mode="determinate", maximum=100)
-            self.progress.grid(row=8, column=0, columnspan=4, sticky="ew", padx=10, pady=5)
+            self.progress.grid(row=18, column=0, columnspan=4, sticky="ew", padx=10, pady=5)
             self.status_var = tk.StringVar(value="就绪")
             ttk.Label(frm, textvariable=self.status_var, anchor="w").grid(
-                row=9, column=0, columnspan=3, sticky="ew", padx=(10, 5), pady=5)
+                row=19, column=0, columnspan=3, sticky="ew", padx=(10, 5), pady=5)
             ttk.Label(frm, text="v%s" % VERSION, foreground="#888888").grid(
-                row=9, column=3, sticky="e", padx=(0, 10), pady=5)
+                row=19, column=3, sticky="e", padx=(0, 10), pady=5)
 
             # 日志
-            ttk.Label(frm, text="运行日志:").grid(row=10, column=0, columnspan=4, sticky="w", **pad)
-            self.log_text = tk.Text(frm, height=9, state="disabled", wrap="word")
-            self.log_text.grid(row=11, column=0, columnspan=3, sticky="nsew", padx=10, pady=5)
+            ttk.Label(frm, text="运行日志:").grid(row=20, column=0, columnspan=4, sticky="w", **pad)
+            self.log_text = tk.Text(frm, height=7, state="disabled", wrap="word")
+            self.log_text.grid(row=21, column=0, columnspan=3, sticky="nsew", padx=10, pady=5)
             log_scroll = ttk.Scrollbar(frm, command=self.log_text.yview)
-            log_scroll.grid(row=11, column=3, sticky="ns", pady=5)
+            log_scroll.grid(row=21, column=3, sticky="ns", pady=5)
             self.log_text.config(yscrollcommand=log_scroll.set)
 
-            frm.rowconfigure(11, weight=1)
+            frm.rowconfigure(21, weight=1)
             frm.columnconfigure(0, weight=1)
 
             self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -915,6 +1136,21 @@ if TK_AVAILABLE:
             d = filedialog.askdirectory(title="选择输出目录")
             if d:
                 self.out_var.set(d)
+
+        def browse_cover(self):
+            """选择自定义封面图片（v1.3.0）"""
+            p = filedialog.askopenfilename(
+                title="选择封面图片（jpg / png / gif / webp）",
+                filetypes=[("图片文件", "*.jpg *.jpeg *.png *.gif *.webp"), ("所有文件", "*.*")])
+            if p:
+                self.cover_var.set(p)
+
+        def on_css_preset(self, _event=None):
+            """CSS 预设下拉选择后填充到文本框（v1.3.0）"""
+            name = self.css_preset_var.get()
+            if name in CSS_PRESETS:
+                self.css_text.delete("1.0", tk.END)
+                self.css_text.insert("1.0", CSS_PRESETS[name])
 
         # ---- 控制（暂停/继续、取消）
         def on_pause_toggle(self):
@@ -1032,6 +1268,26 @@ if TK_AVAILABLE:
                 jobs = max(MIN_CONCURRENCY, min(MAX_CONCURRENCY, int(self.jobs_var.get())))
             except (TypeError, ValueError):
                 jobs = DEFAULT_CONCURRENCY
+
+            # ④ EPUB 选项收集（v1.3.0）
+            opts = {}
+            if self.author_var.get().strip():
+                opts["author"] = self.author_var.get().strip()
+            lang = self.language_var.get().strip()
+            if lang:
+                opts["language"] = lang
+            if self.tags_var.get().strip():
+                opts["tags"] = self.tags_var.get().strip()
+            if self.desc_var.get().strip():
+                opts["description"] = self.desc_var.get().strip()
+            if self.chapters_var.get().strip():
+                opts["chapters"] = self.chapters_var.get().strip()
+            if self.cover_var.get().strip():
+                opts["cover"] = self.cover_var.get().strip()
+            css = self.css_text.get("1.0", tk.END).strip()
+            if css:
+                opts["css"] = css
+
             self.pause_event = threading.Event()
             self.pause_event.set()
             self.cancel_event = threading.Event()
@@ -1046,13 +1302,27 @@ if TK_AVAILABLE:
                 self.append_log("  %d. %s" % (i, s))
             self.append_log("输出目录: %s" % out_dir)
             self.append_log("并发下载: %d 线程" % jobs)
+            if opts.get("author"):
+                self.append_log("作者: %s" % opts["author"])
+            if opts.get("language"):
+                self.append_log("语言: %s" % opts["language"])
+            if opts.get("tags"):
+                self.append_log("标签: %s" % opts["tags"])
+            if opts.get("description"):
+                self.append_log("描述: %s" % opts["description"])
+            if opts.get("chapters"):
+                self.append_log("章节分组: %s" % opts["chapters"])
+            if opts.get("cover"):
+                self.append_log("自定义封面: %s" % opts["cover"])
+            if opts.get("css"):
+                self.append_log("自定义 CSS: %d 字符" % len(opts["css"]))
             if len(inputs) > 1 and title:
                 self.append_log("[提示] 批量模式自动取各文件标题，书名栏仅对单输入生效")
             self.worker = threading.Thread(
-                target=self._run, args=(inputs, out_dir, title, jobs), daemon=True)
+                target=self._run, args=(inputs, out_dir, title, jobs, opts), daemon=True)
             self.worker.start()
 
-        def _run(self, inputs, out_dir, title, jobs):
+        def _run(self, inputs, out_dir, title, jobs, opts=None):
             def cb(pct, msg):
                 self.queue.put(("progress", (pct, msg)))
 
@@ -1064,7 +1334,8 @@ if TK_AVAILABLE:
                                         progress_cb=cb, log_cb=log_only,
                                         concurrency=jobs,
                                         pause_event=self.pause_event,
-                                        cancel_event=self.cancel_event)
+                                        cancel_event=self.cancel_event,
+                                        **(opts or {}))
                 self.queue.put(("batch_done", (results, out_dir)))
             except Exception as e:
                 self.queue.put(("error", e))
@@ -1076,13 +1347,18 @@ if TK_AVAILABLE:
 # ---------------------------------------------------------------- 主入口
 
 def run_cli(argv):
-    """命令行模式（支持批量 / 并发 / 暂停 / 取消）：
+    """命令行模式（支持批量 / 并发 / 暂停 / 取消 / EPUB 选项）：
 
       单输入  : --cli <链接或路径> [--out 目录] [--title 书名] [--jobs 1-64]
       多输入  : --cli <输入1> <输入2> ... [--out 目录]
       扫文件夹: --cli --dir <文件夹> [--out 目录]
       组合    : --cli <输入1> --dir <文件夹> ... [--out 目录]
       查版本  : --version
+
+    v1.3.0 可选参数：
+      --author <作者>  --language <语言>  --tags <标签,逗号分隔>
+      --description <描述>  --chapters <分组,如 第1卷:1-20,第2卷:21-40>
+      --cover <封面图片路径>  --css <自定义CSS文本>
 
     转换中控制信号（Windows）：
       Ctrl+C    → 优雅取消（清理临时文件，已完成保留、未完成标记取消）
@@ -1114,6 +1390,15 @@ def run_cli(argv):
         except ValueError:
             log("[提示] --jobs 参数无效，使用默认 %d" % DEFAULT_CONCURRENCY)
 
+    # v1.3.0 选项参数
+    author = take("--author")
+    language = take("--language")
+    tags = take("--tags")
+    description = take("--description")
+    chapters = take("--chapters")
+    cover = take("--cover")
+    css = take("--css")
+
     inputs = [a for a in args if a.strip() and not a.startswith("--")]
     for d in dirs:
         inputs.extend(scan_dir_for_html(d))
@@ -1125,6 +1410,10 @@ def run_cli(argv):
         log("  扫文件夹: python telegraph-epub-converter.py --cli --dir <文件夹> [--out 目录]")
         log("  组合    : python telegraph-epub-converter.py --cli <输入1> --dir <文件夹> ... [--out 目录]")
         log("  查版本  : python telegraph-epub-converter.py --version")
+        log("v1.3.0 可选参数:")
+        log("  --author <作者>  --language <语言>  --tags <标签,逗号分隔>  --description <描述>")
+        log("  --chapters <分组>（如 \"第1卷:1-20,第2卷:21-40\"）")
+        log("  --cover <封面图片路径>  --css <自定义CSS文本>")
         log("转换中：Ctrl+C 取消，Ctrl+Break 暂停/继续")
         return 1
 
@@ -1167,10 +1456,27 @@ def run_cli(argv):
     log("并发下载: %d 线程（Ctrl+C 取消，Ctrl+Break 暂停/继续）" % concurrency)
     if len(inputs) > 1 and title:
         log("[提示] 批量模式自动取各文件标题，--title 仅对单输入生效")
+    if author:
+        log("作者: %s" % author)
+    if language:
+        log("语言: %s" % language)
+    if tags:
+        log("标签: %s" % tags)
+    if description:
+        log("描述: %s" % description)
+    if chapters:
+        log("章节分组: %s" % chapters)
+    if cover:
+        log("自定义封面: %s" % cover)
+    if css:
+        log("自定义 CSS: %d 字符" % len(css))
 
     results = convert_batch(inputs, out_dir, title=title, log_cb=log,
                             concurrency=concurrency,
-                            pause_event=pause_event, cancel_event=cancel_event)
+                            pause_event=pause_event, cancel_event=cancel_event,
+                            author=author, language=language, tags=tags,
+                            description=description, chapters=chapters,
+                            cover=cover, css=css)
     ok = sum(1 for _, ok_, _ in results if ok_)
     failed = [(i, d) for i, ok_, d in results if not ok_ and d != "已取消"]
     cancelled = [(i, d) for i, ok_, d in results if d == "已取消"]

@@ -23,7 +23,6 @@ exe = EXE(
     a.datas,
     [],
     name='telegraph_epub_converter',
-    version='version_info.txt',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -36,4 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version='version_info.txt',
 )
