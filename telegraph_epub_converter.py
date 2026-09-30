@@ -67,6 +67,7 @@ UA = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 TIMEOUT = 60
+VERSION = "1.1.0"   # 当前版本号（v1.1.0：支持本地整页保存图片相对路径解析）
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
 DEFAULT_CONCURRENCY = 16      # 默认并发下载线程数
 MAX_CONCURRENCY = 64         # 并发数上限
@@ -148,22 +149,42 @@ def sanitize_filename(name):
 
 
 def extract_image_urls(html_text):
-    """按出现顺序提取 HTML 中的漫画图片 URL（telegra.ph 原图）"""
-    urls = re.findall(r'<img[^>]*src="(https?://[^"]+)"', html_text, re.I)
+    """按出现顺序提取 HTML 中的漫画图片引用。
+
+    支持两种来源：
+    - http(s) 外链（telegra.ph 原图 / 图床）
+    - 本地相对路径（浏览器整页保存时，如 ./xxx_files/0001.webp）
+    """
+    urls = re.findall(r'<img[^>]*src=["\']([^"\']+)["\']', html_text, re.I)
     seen, out = set(), []
     for u in urls:
         u = html_mod.unescape(u)
         if u in seen:
             continue
         seen.add(u)
-        if re.search(r"\.(jpe?g|png|gif|webp|avif)(\?|$)", u, re.I) or "telegra.ph" in u:
+        low = u.lstrip().lower()
+        if low.startswith("data:"):
+            continue
+        if re.search(r"\.(jpe?g|png|gif|webp|avif|bmp|svg)(\?|#.*)?$", low) or "telegra.ph" in low:
             out.append(u)
     return out
 
 
+def resolve_local_image_ref(u, html_path):
+    """把本地 HTML 中提取的图片引用解析为绝对路径；网络 URL 原样返回。"""
+    if u.lower().startswith(("http://", "https://", "data:")):
+        return u
+    base = os.path.dirname(os.path.abspath(html_path))
+    return os.path.normpath(os.path.join(base, u))
+
+
 def download_image(url, dest):
-    """下载单张图片到本地，返回字节数"""
-    data = fetch(url)
+    """下载单张图片到本地，返回字节数（支持网络 URL 与本地路径）"""
+    if url.lower().startswith(("http://", "https://")):
+        data = fetch(url)
+    else:
+        with open(url, "rb") as f:
+            data = f.read()
     with open(dest, "wb") as f:
         f.write(data)
     return len(data)
@@ -546,6 +567,8 @@ def convert(input_raw, out_dir, title=None, progress_cb=None, log_cb=None,
     emit(3, "解析页面 HTML ...")
     html_text = load_html(src_type, url, file_path)
     img_urls = extract_image_urls(html_text)
+    if src_type == "file":
+        img_urls = [resolve_local_image_ref(u, file_path) for u in img_urls]
     if not img_urls:
         raise ValueError("页面中未找到任何漫画图片，请确认输入的是 telegra.ph 漫画网页")
     emit(5, "共提取到 %d 张漫画图片" % len(img_urls))

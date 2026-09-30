@@ -22,7 +22,7 @@ telegra.ph 漫画网页一键转 EPUB 电子书工具（tkinter GUI + CLI，支�
 
 ## 功能特性
 
-- 支持本地 HTML 网页保存文件：**无扩展名 / .html / .htm** 均可自动识别
+- 支持本地 HTML 网页保存文件：**无扩展名 / .html / .htm** 均可自动识别；整页保存（含同名 `_files` 图片目录）的相对路径图片自动解析，不再漏图
 - 支持 telegra.ph 在线链接：自动下载页面 HTML 与全部漫画图片
 - 批量转换：
   - GUI：输入列表支持多条（文件多选 / 在线链接 / 扫描文件夹），可增删、清空，逐个转换并汇总成功 / 失败 / 取消结果
@@ -46,12 +46,12 @@ python -c "import tkinter, zipfile, urllib.request"
 
 ### Windows 免安装版（exe）
 
-**v1.0.0 已发布 Release**，提供 Windows 免安装 exe 直接下载：
+**v1.1.0 已发布 Release**，提供 Windows 免安装 exe 直接下载：
 
-- 下载地址：[telegraph_epub_converter.exe](https://github.com/lisaifei24/telegraph_epub_converter/releases/download/v1.0.0/telegraph_epub_converter.exe)（约 12.2MB，免安装、无需 Python 环境）
-- SHA-256：`1449ad6857a47843894fd56022f86e0225b9873302e5dd5e1da02eeb145c8bb7`
-- Release 页面：https://github.com/lisaifei24/telegraph_epub_converter/releases/tag/v1.0.0
-- 功能简介：支持 GUI / CLI 双模式、批量转换、图片并发下载、暂停 / 取消等全部功能
+- 下载地址：[telegraph_epub_converter.exe](https://github.com/lisaifei24/telegraph_epub_converter/releases/download/v1.1.0/telegraph_epub_converter.exe)（约 12.2MB，免安装、无需 Python 环境）
+- SHA-256：`8965824031792FFBBFAEC7B8035D26852E75706FA00910A35C2BC0E8A338D1EB`
+- Release 页面：https://github.com/lisaifei24/telegraph_epub_converter/releases/tag/v1.1.0
+- 功能简介：支持 GUI / CLI 双模式、批量转换、图片并发下载、暂停 / 取消等全部功能；v1.1.0 新增本地整页保存图片（相对路径 `_files` 目录）解析支持，修复本地 HTML 转换提示"未找到任何漫画图片"的问题
 
 ## 使用
 
@@ -111,7 +111,7 @@ python telegraph_epub_converter.py --cli "https://telegra.ph/xxx" --title "我�
 
 1. **识别输入**：在线链接直接使用；本地路径按 原路径 → `.html` → `.htm` 依次探测
 2. **获取页面 HTML**：在线链接用带浏览器 UA 的 urllib 下载；本地文件直接读取
-3. **提取图片**：正则按出现顺序提取 `<img src="...">` 外链，过滤为图片地址并去重
+3. **提取图片**：正则按出现顺序提取 `<img src="...">`；本地文件中的相对路径引用（如 `./xxx_files/0001.webp`）自动解析为绝对路径，网络外链按原样处理，过滤为图片地址并去重
 4. **下载图片**：多线程并发下载到临时目录（默认 16 线程，`--jobs` 可配），瞬时网络错误自动重试 3 次（逐步退避），下载完成后严格按页面顺序写回 EPUB；任一图片最终失败则该本转换失败（不静默跳过），由批量流程汇总记录
 5. **生成 EPUB**：纯 `zipfile` 手写 EPUB3：
    - `mimetype`（不压缩，必须第一个条目）
@@ -141,6 +141,9 @@ python telegraph_epub_converter.py --cli "https://telegra.ph/xxx" --title "我�
 
 **Q6：转换时界面卡死？**
 不会。GUI 的转换在后台线程执行，通过队列向主线程推送进度，界面始终可响应；转换中可用 `暂停/继续` 挂起、`取消` 终止（当前及后续任务，已完成的输出保留）；重复点击转换按钮会提示"正在转换中"。
+
+**Q7：本地整页保存的 Telegraph HTML 转换时提示"未找到任何漫画图片"？**
+这是旧版（v1.0.0 及之前）的已知问题：整页保存的网页图片存放在同名 `_files` 目录中，`<img>` 使用的是 `./xxx_files/0001.webp` 这类本地相对路径，旧版只匹配 `http(s)` 外链导致全部漏掉。v1.1.0 已支持相对路径图片解析（含 `.webp` / `.avif` 等扩展名），升级即可修复。
 *（内容由AI生成，仅供参考）*
 *（内容由AI生成，仅供参考）*
 *（内容由AI生成，仅供参考）*

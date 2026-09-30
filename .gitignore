@@ -30,3 +30,6 @@ dist/
 # 日志与临时文件
 *.log
 *.tmp
+
+# 转换输出目录
+Download/
