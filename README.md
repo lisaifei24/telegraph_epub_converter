@@ -2,12 +2,14 @@
 AIGC:
     Label: "1"
     ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: 7e577fda4eb3f93d3f58265fe8d82685_57bbae82bb8111f18442525400de85a5
-    ReservedCode1: 4Tn3pKc6oaMMYrE1dindr9TcJgZqrCKYsCQdn6pGd/Vsb9G6RKMWyg/ElTGUSpP9IICdPbTyedVuriFzw9MJKbBlGMcSPCZBjWNqhMS4VQgiKLX83W/1f5ZHxokI2pqp/NWIG8JPx+S11rs/PE5lmM8rj5+7GqOI3nlAXJf2k3c1ePDWz0hK0VOfkvs=
+    ProduceID: 7e577fda4eb3f93d3f58265fe8d82685_ef667eafbb8311f18442525400de85a5
+    ReservedCode1: UOF6V+EC9L0G2yuO0CAm+8wPYKIut1f+5LydqIa+YbF+e85Y5OA6kZEmj5r3mrSj4EYrXvqQ4WND9BfnAGGKXEuM56psqspP8BHcms0g8l9GeU5Rhb6YhBJ8tWDT4VYVCPijJjIEPfzbzQY8rMfRGXSYXz0JaxIzjtNAkL6rM4Wdox8wLkyfxakRLpA=
     ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: 7e577fda4eb3f93d3f58265fe8d82685_57bbae82bb8111f18442525400de85a5
-    ReservedCode2: 4Tn3pKc6oaMMYrE1dindr9TcJgZqrCKYsCQdn6pGd/Vsb9G6RKMWyg/ElTGUSpP9IICdPbTyedVuriFzw9MJKbBlGMcSPCZBjWNqhMS4VQgiKLX83W/1f5ZHxokI2pqp/NWIG8JPx+S11rs/PE5lmM8rj5+7GqOI3nlAXJf2k3c1ePDWz0hK0VOfkvs=
+    PropagateID: 7e577fda4eb3f93d3f58265fe8d82685_ef667eafbb8311f18442525400de85a5
+    ReservedCode2: UOF6V+EC9L0G2yuO0CAm+8wPYKIut1f+5LydqIa+YbF+e85Y5OA6kZEmj5r3mrSj4EYrXvqQ4WND9BfnAGGKXEuM56psqspP8BHcms0g8l9GeU5Rhb6YhBJ8tWDT4VYVCPijJjIEPfzbzQY8rMfRGXSYXz0JaxIzjtNAkL6rM4Wdox8wLkyfxakRLpA=
 ---
+
+
 
 
 
@@ -130,5 +132,6 @@ python telegraph_epub_converter.py --cli "https://telegra.ph/xxx" --title "我�
 
 **Q6：转换时界面卡死？**
 不会。GUI 的转换在后台线程执行，通过队列向主线程推送进度，界面始终可响应；转换中可用 `暂停/继续` 挂起、`取消` 终止（当前及后续任务，已完成的输出保留）；重复点击转换按钮会提示"正在转换中"。
+*（内容由AI生成，仅供参考）*
 *（内容由AI生成，仅供参考）*
 *（内容由AI生成，仅供参考）*
