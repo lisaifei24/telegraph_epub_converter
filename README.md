@@ -1,18 +1,3 @@
----
-AIGC:
-    Label: "1"
-    ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: 7e577fda4eb3f93d3f58265fe8d82685_ef667eafbb8311f18442525400de85a5
-    ReservedCode1: UOF6V+EC9L0G2yuO0CAm+8wPYKIut1f+5LydqIa+YbF+e85Y5OA6kZEmj5r3mrSj4EYrXvqQ4WND9BfnAGGKXEuM56psqspP8BHcms0g8l9GeU5Rhb6YhBJ8tWDT4VYVCPijJjIEPfzbzQY8rMfRGXSYXz0JaxIzjtNAkL6rM4Wdox8wLkyfxakRLpA=
-    ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: 7e577fda4eb3f93d3f58265fe8d82685_ef667eafbb8311f18442525400de85a5
-    ReservedCode2: UOF6V+EC9L0G2yuO0CAm+8wPYKIut1f+5LydqIa+YbF+e85Y5OA6kZEmj5r3mrSj4EYrXvqQ4WND9BfnAGGKXEuM56psqspP8BHcms0g8l9GeU5Rhb6YhBJ8tWDT4VYVCPijJjIEPfzbzQY8rMfRGXSYXz0JaxIzjtNAkL6rM4Wdox8wLkyfxakRLpA=
----
-
-
-
-
-
 # telegraph-epub-converter
 
 telegra.ph 漫画网页一键转 EPUB 电子书工具（tkinter GUI + CLI，支持批量转换）。
